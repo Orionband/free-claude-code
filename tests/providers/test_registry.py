@@ -10,7 +10,7 @@ from config.provider_ids import SUPPORTED_PROVIDER_IDS
 from providers.cerebras import CerebrasProvider
 from providers.codestral import CodestralProvider
 from providers.deepseek import DeepSeekProvider
-from providers.exceptions import UnknownProviderTypeError
+from providers.exceptions import AuthenticationError, UnknownProviderTypeError
 from providers.fireworks import FireworksProvider
 from providers.gemini import GeminiProvider
 from providers.groq import GroqProvider
@@ -244,3 +244,20 @@ async def test_provider_registry_cleanup_exceptiongroup_on_multiple_failures() -
         await reg.cleanup()
     assert len(exc_info.value.exceptions) == 2
     assert reg._providers == {}
+
+
+def test_build_provider_config_accepts_comma_separated_nvidia_keys() -> None:
+    descriptor = PROVIDER_CATALOG["nvidia_nim"]
+    settings = _make_settings(nvidia_nim_api_key="key-a, key-b")
+
+    config = build_provider_config(descriptor, settings)
+
+    assert config.api_key == "key-a, key-b"
+
+
+def test_build_provider_config_rejects_blank_nvidia_keys() -> None:
+    descriptor = PROVIDER_CATALOG["nvidia_nim"]
+    settings = _make_settings(nvidia_nim_api_key=" , ")
+
+    with pytest.raises(AuthenticationError, match="NVIDIA_NIM_API_KEY"):
+        build_provider_config(descriptor, settings)

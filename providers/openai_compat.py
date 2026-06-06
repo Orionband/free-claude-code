@@ -105,6 +105,7 @@ class OpenAIChatTransport(BaseProvider):
         provider_name: str,
         base_url: str,
         api_key: str,
+        http_client: httpx.AsyncClient | None = None,
     ):
         super().__init__(config)
         self._provider_name = provider_name
@@ -116,8 +117,7 @@ class OpenAIChatTransport(BaseProvider):
             rate_window=config.rate_window,
             max_concurrency=config.max_concurrency,
         )
-        http_client = None
-        if config.proxy:
+        if http_client is None and config.proxy:
             http_client = httpx.AsyncClient(
                 proxy=config.proxy,
                 timeout=httpx.Timeout(
@@ -127,9 +127,24 @@ class OpenAIChatTransport(BaseProvider):
                     write=config.http_write_timeout,
                 ),
             )
-        self._client = AsyncOpenAI(
+        self._client = self._make_openai_client(
             api_key=self._api_key,
             base_url=self._base_url,
+            config=config,
+            http_client=http_client,
+        )
+
+    def _make_openai_client(
+        self,
+        *,
+        api_key: str,
+        base_url: str,
+        config: ProviderConfig,
+        http_client: httpx.AsyncClient | None,
+    ) -> AsyncOpenAI:
+        return AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
             max_retries=0,
             timeout=httpx.Timeout(
                 config.http_read_timeout,
@@ -140,6 +155,10 @@ class OpenAIChatTransport(BaseProvider):
             http_client=http_client,
         )
 
+    def _openai_client(self) -> AsyncOpenAI:
+        """Return the OpenAI client used for the current upstream request."""
+        return self._client
+
     async def cleanup(self) -> None:
         """Release HTTP client resources."""
         client = getattr(self, "_client", None)
@@ -148,7 +167,7 @@ class OpenAIChatTransport(BaseProvider):
 
     async def list_model_ids(self) -> frozenset[str]:
         """Return model ids from the provider's OpenAI-compatible models endpoint."""
-        payload = await self._client.models.list()
+        payload = await self._openai_client().models.list()
         return extract_openai_model_ids(payload, provider_name=self._provider_name)
 
     @abstractmethod
@@ -184,8 +203,9 @@ class OpenAIChatTransport(BaseProvider):
         """Create a streaming chat completion, optionally retrying once."""
         try:
             create_body = self._prepare_create_body(body)
+            client = self._openai_client()
             stream = await self._global_rate_limiter.execute_with_retry(
-                self._client.chat.completions.create, **create_body, stream=True
+                client.chat.completions.create, **create_body, stream=True
             )
             return stream, body
         except Exception as error:
@@ -194,8 +214,9 @@ class OpenAIChatTransport(BaseProvider):
                 raise
 
             create_retry_body = self._prepare_create_body(retry_body)
+            client = self._openai_client()
             stream = await self._global_rate_limiter.execute_with_retry(
-                self._client.chat.completions.create, **create_retry_body, stream=True
+                client.chat.completions.create, **create_retry_body, stream=True
             )
             return stream, retry_body
 

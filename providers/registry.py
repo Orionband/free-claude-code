@@ -25,6 +25,7 @@ from providers.exceptions import (
     UnknownProviderTypeError,
 )
 from providers.model_listing import ProviderModelInfo, model_infos_from_ids
+from providers.nvidia_nim.keys import parse_nvidia_nim_api_keys
 
 ProviderFactory = Callable[[ProviderConfig, Settings], BaseProvider]
 
@@ -181,10 +182,16 @@ def _credential_for(descriptor: ProviderDescriptor, settings: Settings) -> str:
     return ""
 
 
+def _credential_configured(descriptor: ProviderDescriptor, credential: str) -> bool:
+    if descriptor.provider_id == "nvidia_nim":
+        return bool(parse_nvidia_nim_api_keys(credential))
+    return bool(credential.strip())
+
+
 def _require_credential(descriptor: ProviderDescriptor, credential: str) -> None:
     if descriptor.credential_env is None:
         return
-    if credential and credential.strip():
+    if _credential_configured(descriptor, credential):
         return
     message = f"{descriptor.credential_env} is not set. Add it to your .env file."
     if descriptor.credential_url:
@@ -280,9 +287,8 @@ def _model_list_provider_ids_for_settings(settings: Settings) -> tuple[str, ...]
             if provider_id in referenced_provider_ids:
                 provider_ids.append(provider_id)
             continue
-        if (
-            descriptor.credential_env is not None
-            and _credential_for(descriptor, settings).strip()
+        if descriptor.credential_env is not None and _credential_configured(
+            descriptor, _credential_for(descriptor, settings)
         ):
             provider_ids.append(provider_id)
     return tuple(provider_ids)

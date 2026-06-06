@@ -583,6 +583,27 @@ class TestSettingsOptionalStr:
         s = Settings()
         assert s.whisper_device == device
 
+    def test_nvidia_nim_voice_accepts_comma_separated_api_keys(self, monkeypatch):
+        from config.settings import Settings
+
+        monkeypatch.setenv("VOICE_NOTE_ENABLED", "true")
+        monkeypatch.setenv("WHISPER_DEVICE", "nvidia_nim")
+        monkeypatch.setenv("NVIDIA_NIM_API_KEY", "key-a, key-b")
+
+        settings = Settings()
+
+        assert settings.nvidia_nim_api_key == "key-a, key-b"
+
+    def test_nvidia_nim_voice_requires_at_least_one_api_key(self, monkeypatch):
+        from config.settings import Settings
+
+        monkeypatch.setenv("VOICE_NOTE_ENABLED", "true")
+        monkeypatch.setenv("WHISPER_DEVICE", "nvidia_nim")
+        monkeypatch.setenv("NVIDIA_NIM_API_KEY", " , ")
+
+        with pytest.raises(ValidationError, match="NVIDIA_NIM_API_KEY"):
+            Settings()
+
 
 class TestPerModelMapping:
     """Test per-model fields and resolve_model()."""

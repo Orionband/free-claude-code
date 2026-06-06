@@ -116,6 +116,10 @@ def test_admin_config_masks_secrets_and_exposes_manifest(monkeypatch, tmp_path):
     assert auth_field["secret"] is True
     assert auth_field["value"] == MASKED_SECRET
     assert auth_field["source"] == "template"
+    nim_field = next(
+        field for field in body["fields"] if field["key"] == "NVIDIA_NIM_API_KEY"
+    )
+    assert "Comma-separated" in nim_field["description"]
 
 
 def test_admin_config_preserves_managed_env_source_contract(monkeypatch, tmp_path):

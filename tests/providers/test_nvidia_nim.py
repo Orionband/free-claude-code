@@ -1,5 +1,5 @@
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import openai
 import pytest
@@ -120,6 +120,49 @@ async def test_init(provider_config):
         assert provider._api_key == "test_key"
         assert provider._base_url == "https://test.api.nvidia.com/v1"
         mock_openai.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_init_builds_client_per_comma_separated_api_key():
+    """Multiple NVIDIA keys create one OpenAI client per key."""
+    from providers.base import ProviderConfig
+
+    config = ProviderConfig(
+        api_key="key-a,key-b,key-c",
+        base_url="https://test.api.nvidia.com/v1",
+    )
+    with patch("providers.openai_compat.AsyncOpenAI") as mock_openai:
+        provider = NvidiaNimProvider(config, nim_settings=NimSettings())
+
+    assert provider._api_keys == ("key-a", "key-b", "key-c")
+    assert len(provider._clients) == 3
+    assert mock_openai.call_count == 3
+    api_keys_used = [call.kwargs["api_key"] for call in mock_openai.call_args_list]
+    assert api_keys_used == ["key-a", "key-b", "key-c"]
+
+
+@pytest.mark.asyncio
+async def test_openai_client_rotates_across_configured_keys():
+    from providers.base import ProviderConfig
+
+    config = ProviderConfig(
+        api_key="key-a,key-b",
+        base_url="https://test.api.nvidia.com/v1",
+    )
+    with patch("providers.openai_compat.AsyncOpenAI"):
+        provider = NvidiaNimProvider(config, nim_settings=NimSettings())
+
+    first, second = object(), object()
+    with patch.object(provider, "_clients", (first, second)):
+        with patch(
+            "providers.nvidia_nim.client.random.choice",
+            side_effect=[first, second, first],
+        ) as choice:
+            assert provider._openai_client() is first
+            assert provider._openai_client() is second
+            assert provider._openai_client() is first
+
+    assert choice.call_args_list == [call((first, second))] * 3
 
 
 @pytest.mark.asyncio

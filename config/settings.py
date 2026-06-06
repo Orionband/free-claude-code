@@ -416,15 +416,14 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def check_nvidia_nim_api_key(self) -> Settings:
-        if (
-            self.voice_note_enabled
-            and self.whisper_device == "nvidia_nim"
-            and not self.nvidia_nim_api_key.strip()
-        ):
-            raise ValueError(
-                "NVIDIA_NIM_API_KEY is required when WHISPER_DEVICE is 'nvidia_nim'. "
-                "Set it in your .env file."
-            )
+        if self.voice_note_enabled and self.whisper_device == "nvidia_nim":
+            from providers.nvidia_nim.keys import parse_nvidia_nim_api_keys
+
+            if not parse_nvidia_nim_api_keys(self.nvidia_nim_api_key):
+                raise ValueError(
+                    "NVIDIA_NIM_API_KEY is required when WHISPER_DEVICE is 'nvidia_nim'. "
+                    "Set it in your .env file."
+                )
         return self
 
     @model_validator(mode="after")

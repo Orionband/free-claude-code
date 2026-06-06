@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from messaging.transcription import transcribe_audio
 
@@ -24,6 +25,34 @@ def test_transcribe_audio_nvidia_nim_forwards_api_key(tmp_path: Path) -> None:
         wav, "openai/whisper-large-v3", api_key="test-nim-key"
     )
     assert out == "ok"
+
+
+def test_transcribe_audio_file_picks_one_comma_separated_key(tmp_path: Path) -> None:
+    from providers.nvidia_nim.voice import transcribe_audio_file
+
+    wav = tmp_path / "stub.wav"
+    wav.write_bytes(b"\x00" * 128)
+    response = MagicMock()
+    response.results = [MagicMock(alternatives=[MagicMock(transcript="hello")])]
+
+    riva_client = MagicMock()
+    riva_client.Auth.return_value = MagicMock()
+    riva_client.ASRService.return_value.offline_recognize.return_value = response
+    riva_pkg = MagicMock()
+    riva_pkg.client = riva_client
+
+    with patch("providers.nvidia_nim.voice.pick_nvidia_nim_api_key", return_value="key-b"):
+        with patch.dict(sys.modules, {"riva": riva_pkg, "riva.client": riva_client}):
+            out = transcribe_audio_file(
+                wav,
+                "openai/whisper-large-v3",
+                api_key="key-a,key-b",
+            )
+
+    riva_client.Auth.assert_called_once()
+    metadata_args = riva_client.Auth.call_args.kwargs["metadata_args"]
+    assert ["authorization", "Bearer key-b"] in metadata_args
+    assert out == "hello"
 
 
 def test_nim_asr_model_map_entries_are_real_function_ids() -> None:

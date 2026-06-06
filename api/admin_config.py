@@ -124,7 +124,10 @@ FIELDS: tuple[ConfigFieldSpec, ...] = (
         "secret",
         settings_attr="nvidia_nim_api_key",
         secret=True,
-        description="Used by NVIDIA NIM chat and optional NIM voice transcription.",
+        description=(
+            "Used by NVIDIA NIM chat and optional NIM voice transcription. "
+            "Comma-separated values rotate randomly per request to spread rate limits."
+        ),
     ),
     ConfigFieldSpec(
         "OPENROUTER_API_KEY",

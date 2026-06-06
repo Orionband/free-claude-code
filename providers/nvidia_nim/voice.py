@@ -6,6 +6,8 @@ from pathlib import Path
 
 from loguru import logger
 
+from providers.nvidia_nim.keys import parse_nvidia_nim_api_keys, pick_nvidia_nim_api_key
+
 # NVIDIA NIM Whisper model mapping: (function_id, language_code)
 _NIM_ASR_MODEL_MAP: dict[str, tuple[str, str]] = {
     "nvidia/parakeet-ctc-0.6b-zh-tw": ("8473f56d-51ef-473c-bb26-efd4f5def2bf", "zh-TW"),
@@ -41,12 +43,12 @@ def transcribe_audio_file(
     Returns:
         Transcript text, or ``(no speech detected)`` when empty.
     """
-    key = (api_key or "").strip()
-    if not key:
+    if not parse_nvidia_nim_api_keys(api_key or ""):
         raise ValueError(
             "NVIDIA NIM transcription requires a non-empty nvidia_nim_api_key "
             "(configure NVIDIA_NIM_API_KEY or pass api_key explicitly)."
         )
+    key = pick_nvidia_nim_api_key(api_key)
 
     try:
         import riva.client
