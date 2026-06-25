@@ -59,7 +59,7 @@ Free Claude Code routes Anthropic Messages API traffic from Claude Code to any p
 macOS/Linux:
 
 ```bash
-curl -fsSL "https://github.com/Alishahryar1/free-claude-code/blob/main/scripts/install.sh?raw=1" | sh
+curl -fsSL "https://github.com/Orionband/free-claude-code/blob/main/scripts/install.sh?raw=1" | sh
 ```
 
 Windows PowerShell:
@@ -68,7 +68,7 @@ Windows PowerShell:
 irm "https://github.com/Orionband/free-claude-code/blob/main/scripts/install.ps1?raw=1" | iex
 ```
 
-Review the installers at [scripts/install.sh](https://github.com/Alishahryar1/free-claude-code/blob/main/scripts/install.sh) and [scripts/install.ps1](https://github.com/Orionband/free-claude-code/blob/main/scripts/install.ps1). Re-run these commands to update to the latest version.
+Review the installers at [scripts/install.sh](https://github.com/Orionband/free-claude-code/blob/main/scripts/install.sh) and [scripts/install.ps1](https://github.com/Orionband/free-claude-code/blob/main/scripts/install.ps1). Re-run these commands to update to the latest version.
 
 ### 2. Start The Proxy
 
@@ -406,16 +406,16 @@ macOS/Linux:
 
 ```bash
 # NVIDIA NIM transcription (Riva gRPC)
-curl -fsSL "https://github.com/Alishahryar1/free-claude-code/blob/main/scripts/install.sh?raw=1" | sh -s -- --voice-nim
+curl -fsSL "https://github.com/Orionband/free-claude-code/blob/main/scripts/install.sh?raw=1" | sh -s -- --voice-nim
 
 # Local Whisper (CPU or CUDA)
-curl -fsSL "https://github.com/Alishahryar1/free-claude-code/blob/main/scripts/install.sh?raw=1" | sh -s -- --voice-local
+curl -fsSL "https://github.com/Orionband/free-claude-code/blob/main/scripts/install.sh?raw=1" | sh -s -- --voice-local
 
 # Both backends
-curl -fsSL "https://github.com/Alishahryar1/free-claude-code/blob/main/scripts/install.sh?raw=1" | sh -s -- --voice-all
+curl -fsSL "https://github.com/Orionband/free-claude-code/blob/main/scripts/install.sh?raw=1" | sh -s -- --voice-all
 
 # Local Whisper with CUDA
-curl -fsSL "https://github.com/Alishahryar1/free-claude-code/blob/main/scripts/install.sh?raw=1" | sh -s -- --voice-local --torch-backend cu130
+curl -fsSL "https://github.com/Orionband/free-claude-code/blob/main/scripts/install.sh?raw=1" | sh -s -- --voice-local --torch-backend cu130
 ```
 
 Windows PowerShell:
