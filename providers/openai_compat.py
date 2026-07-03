@@ -43,6 +43,10 @@ from providers.error_mapping import (
     map_error,
     user_visible_message_for_mapped_provider_error,
 )
+from providers.log_context import (
+    resolve_upstream_api_key_for_log,
+    stamp_upstream_api_key_on_exception,
+)
 from providers.model_listing import extract_openai_model_ids
 from providers.rate_limit import GlobalRateLimiter
 
@@ -163,6 +167,15 @@ class OpenAIChatTransport(BaseProvider):
     def _openai_client_api_key(client: AsyncOpenAI) -> str:
         return str(getattr(client, "api_key", "") or "")
 
+    def _resolve_upstream_api_key_for_log(
+        self, error: Exception, upstream_api_key: str
+    ) -> str | None:
+        return resolve_upstream_api_key_for_log(
+            error,
+            upstream_api_key=upstream_api_key or None,
+            fallback_api_key=self._api_key,
+        )
+
     async def cleanup(self) -> None:
         """Release HTTP client resources."""
         client = getattr(self, "_client", None)
@@ -209,12 +222,16 @@ class OpenAIChatTransport(BaseProvider):
             create_body = self._prepare_create_body(body)
             client = self._openai_client()
             api_key = self._openai_client_api_key(client)
-            stream = await self._global_rate_limiter.execute_with_retry(
-                client.chat.completions.create,
-                **create_body,
-                stream=True,
-                api_key=api_key,
-            )
+            try:
+                stream = await self._global_rate_limiter.execute_with_retry(
+                    client.chat.completions.create,
+                    **create_body,
+                    stream=True,
+                    api_key=api_key,
+                )
+            except Exception as error:
+                stamp_upstream_api_key_on_exception(error, api_key)
+                raise
             return stream, body, api_key
         except Exception as error:
             retry_body = self._get_retry_request_body(error, body)
@@ -224,12 +241,16 @@ class OpenAIChatTransport(BaseProvider):
             create_retry_body = self._prepare_create_body(retry_body)
             client = self._openai_client()
             api_key = self._openai_client_api_key(client)
-            stream = await self._global_rate_limiter.execute_with_retry(
-                client.chat.completions.create,
-                **create_retry_body,
-                stream=True,
-                api_key=api_key,
-            )
+            try:
+                stream = await self._global_rate_limiter.execute_with_retry(
+                    client.chat.completions.create,
+                    **create_retry_body,
+                    stream=True,
+                    api_key=api_key,
+                )
+            except Exception as retry_error:
+                stamp_upstream_api_key_on_exception(retry_error, api_key)
+                raise
             return stream, retry_body, api_key
 
     def _restore_aliased_tool_arguments(
@@ -886,7 +907,9 @@ class OpenAIChatTransport(BaseProvider):
                         req_tag,
                         e,
                         request_id=request_id,
-                        api_key=upstream_api_key,
+                        api_key=self._resolve_upstream_api_key_for_log(
+                            e, upstream_api_key
+                        ),
                     )
                     error_message = self._openai_error_message(e, request_id)
                     trace_event(

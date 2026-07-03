@@ -47,6 +47,7 @@ from providers.error_mapping import (
     user_visible_message_for_mapped_provider_error,
 )
 from providers.exceptions import ModelListResponseError
+from providers.log_context import should_log_upstream_transport_http_status
 from providers.model_listing import (
     ProviderModelInfo,
     extract_openai_model_ids,
@@ -690,10 +691,7 @@ class AnthropicMessagesTransport(BaseProvider):
                     )
                     should_log_transport_error = not isinstance(
                         error, httpx.HTTPStatusError
-                    ) or (
-                        isinstance(response_status, int)
-                        and (response_status == 429 or response_status >= 500)
-                    )
+                    ) or should_log_upstream_transport_http_status(response_status)
                     if should_log_transport_error:
                         self._log_stream_transport_error(
                             tag,

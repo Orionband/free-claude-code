@@ -92,12 +92,14 @@ class BaseProvider(ABC):
         from loguru import logger
 
         from core.trace import trace_event
-        from providers.log_context import format_api_key_for_log
+        from providers.log_context import (
+            format_api_key_for_log,
+            normalize_upstream_http_status,
+            upstream_auth_failure_label,
+        )
 
         response = getattr(error, "response", None)
-        http_status = (
-            getattr(response, "status_code", None) if response is not None else None
-        )
+        http_status = normalize_upstream_http_status(error, response)
         trace_event(
             stage="provider",
             event="provider.response.transport_error",
@@ -109,6 +111,16 @@ class BaseProvider(ABC):
             api_key=api_key or None,
         )
         key_tag = format_api_key_for_log(api_key)
+        auth_label = upstream_auth_failure_label(
+            http_status, exc_type=type(error).__name__
+        )
+        if auth_label is not None:
+            logger.warning(
+                "{}{} exc_type={}",
+                auth_label,
+                key_tag,
+                type(error).__name__,
+            )
 
         if self._config.log_api_error_tracebacks:
             logger.error(

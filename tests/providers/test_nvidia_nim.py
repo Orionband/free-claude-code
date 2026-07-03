@@ -824,3 +824,43 @@ async def test_stream_response_bad_request_without_reasoning_budget_does_not_ret
     assert mock_create.await_count == 1
     assert any("Invalid request sent to provider" in event for event in events)
     assert any("message_stop" in event for event in events)
+
+
+def _make_auth_error() -> openai.AuthenticationError:
+    response = Response(
+        status_code=401,
+        request=Request("POST", f"{NVIDIA_NIM_DEFAULT_BASE}/chat/completions"),
+    )
+    body = {
+        "status": 401,
+        "title": "Unauthorized",
+        "detail": "Authentication failed",
+    }
+    return openai.AuthenticationError(
+        "Authentication failed", response=response, body=body
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_response_auth_error_logs_api_key(caplog, provider_config):
+    import logging
+
+    provider_config.api_key = "nvapi-bad-key"
+    provider = NvidiaNimProvider(provider_config, nim_settings=NimSettings())
+    provider._client.api_key = "nvapi-bad-key"
+    req = MockRequest()
+
+    with (
+        patch.object(
+            provider._client.chat.completions,
+            "create",
+            new_callable=AsyncMock,
+            side_effect=_make_auth_error(),
+        ),
+        caplog.at_level(logging.WARNING),
+    ):
+        _ = [e async for e in provider.stream_response(req, request_id="req_test")]
+
+    messages = " | ".join(r.getMessage() for r in caplog.records)
+    assert "nvapi-bad-key" in messages
+    assert "Authentication failed (401)" in messages
