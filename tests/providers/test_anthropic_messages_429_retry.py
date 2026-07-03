@@ -219,10 +219,11 @@ async def test_non_retryable_4xx_http_error_not_retried(provider_config):
         with patch("providers.anthropic_messages.GlobalRateLimiter") as mock_gl:
             instance = mock_gl.get_scoped_instance.return_value
 
-            async def _passthrough(fn, *args, **kwargs):
-                return await fn(*args, **kwargs)
+            from tests.rate_limit_mocks import passthrough_execute_with_retry
 
-            instance.execute_with_retry = AsyncMock(side_effect=_passthrough)
+            instance.execute_with_retry = AsyncMock(
+                side_effect=passthrough_execute_with_retry
+            )
             instance.concurrency_slot.side_effect = _slot
 
             provider = NativeProvider(provider_config)

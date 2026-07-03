@@ -105,10 +105,11 @@ def mock_rate_limiter():
         instance.wait_if_blocked = AsyncMock(return_value=False)
 
         # execute_with_retry should call through to the actual function
-        async def _passthrough(fn, *args, **kwargs):
-            return await fn(*args, **kwargs)
+        from tests.rate_limit_mocks import passthrough_execute_with_retry
 
-        instance.execute_with_retry = AsyncMock(side_effect=_passthrough)
+        instance.execute_with_retry = AsyncMock(
+            side_effect=passthrough_execute_with_retry
+        )
         yield instance
 
 

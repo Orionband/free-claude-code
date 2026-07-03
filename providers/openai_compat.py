@@ -159,6 +159,10 @@ class OpenAIChatTransport(BaseProvider):
         """Return the OpenAI client used for the current upstream request."""
         return self._client
 
+    @staticmethod
+    def _openai_client_api_key(client: AsyncOpenAI) -> str:
+        return str(getattr(client, "api_key", "") or "")
+
     async def cleanup(self) -> None:
         """Release HTTP client resources."""
         client = getattr(self, "_client", None)
@@ -199,15 +203,19 @@ class OpenAIChatTransport(BaseProvider):
         """Return provider-specific per-tool argument aliases for this request."""
         return {}
 
-    async def _create_stream(self, body: dict) -> tuple[Any, dict]:
+    async def _create_stream(self, body: dict) -> tuple[Any, dict, str]:
         """Create a streaming chat completion, optionally retrying once."""
         try:
             create_body = self._prepare_create_body(body)
             client = self._openai_client()
+            api_key = self._openai_client_api_key(client)
             stream = await self._global_rate_limiter.execute_with_retry(
-                client.chat.completions.create, **create_body, stream=True
+                client.chat.completions.create,
+                **create_body,
+                stream=True,
+                api_key=api_key,
             )
-            return stream, body
+            return stream, body, api_key
         except Exception as error:
             retry_body = self._get_retry_request_body(error, body)
             if retry_body is None:
@@ -215,10 +223,14 @@ class OpenAIChatTransport(BaseProvider):
 
             create_retry_body = self._prepare_create_body(retry_body)
             client = self._openai_client()
+            api_key = self._openai_client_api_key(client)
             stream = await self._global_rate_limiter.execute_with_retry(
-                client.chat.completions.create, **create_retry_body, stream=True
+                client.chat.completions.create,
+                **create_retry_body,
+                stream=True,
+                api_key=api_key,
             )
-            return stream, retry_body
+            return stream, retry_body, api_key
 
     def _restore_aliased_tool_arguments(
         self, argument_json: str, aliases: dict[str, str]
@@ -424,7 +436,7 @@ class OpenAIChatTransport(BaseProvider):
         last_error: Exception | None = None
         for attempt in range(MIDSTREAM_RECOVERY_ATTEMPTS):
             try:
-                stream, _ = await self._create_stream(body)
+                stream, _body, _api_key = await self._create_stream(body)
                 text_parts: list[str] = []
                 thinking_parts: list[str] = []
                 async for chunk in stream:
@@ -694,10 +706,11 @@ class OpenAIChatTransport(BaseProvider):
 
         async with self._global_rate_limiter.concurrency_slot():
             early_retries = 0
+            upstream_api_key = ""
             while True:
                 stream_opened = False
                 try:
-                    stream, body = await self._create_stream(body)
+                    stream, body, upstream_api_key = await self._create_stream(body)
                     stream_opened = True
                     tool_argument_aliases = self._tool_argument_aliases(body)
                     async for chunk in stream:
@@ -869,7 +882,11 @@ class OpenAIChatTransport(BaseProvider):
                             return
 
                     self._log_stream_transport_error(
-                        tag, req_tag, e, request_id=request_id
+                        tag,
+                        req_tag,
+                        e,
+                        request_id=request_id,
+                        api_key=upstream_api_key,
                     )
                     error_message = self._openai_error_message(e, request_id)
                     trace_event(

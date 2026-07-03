@@ -86,11 +86,13 @@ class BaseProvider(ABC):
         error: Exception,
         *,
         request_id: str | None = None,
+        api_key: str | None = None,
     ) -> None:
         """Log streaming transport failures (metadata-only unless verbose is enabled)."""
         from loguru import logger
 
         from core.trace import trace_event
+        from providers.log_context import format_api_key_for_log
 
         response = getattr(error, "response", None)
         http_status = (
@@ -104,17 +106,25 @@ class BaseProvider(ABC):
             request_id=request_id,
             exc_type=type(error).__name__,
             http_status=http_status,
+            api_key=api_key or None,
         )
+        key_tag = format_api_key_for_log(api_key)
 
         if self._config.log_api_error_tracebacks:
             logger.error(
-                "{}_ERROR:{} {}: {}", tag, req_tag, type(error).__name__, error
+                "{}_ERROR:{}{} {}: {}",
+                tag,
+                req_tag,
+                key_tag,
+                type(error).__name__,
+                error,
             )
             return
         logger.error(
-            "{}_ERROR:{} exc_type={} http_status={}",
+            "{}_ERROR:{}{} exc_type={} http_status={}",
             tag,
             req_tag,
+            key_tag,
             type(error).__name__,
             http_status,
         )

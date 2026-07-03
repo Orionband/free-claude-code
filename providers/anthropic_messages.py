@@ -385,7 +385,10 @@ class AnthropicMessagesTransport(BaseProvider):
             response: httpx.Response | None = None
             try:
                 response = await self._global_rate_limiter.execute_with_retry(
-                    self._validated_stream_send, body, req_tag=req_tag
+                    self._validated_stream_send,
+                    body,
+                    req_tag=req_tag,
+                    api_key=self._api_key,
                 )
                 state = self._new_stream_state(None, thinking_enabled=thinking_enabled)
                 chunks = [
@@ -572,7 +575,10 @@ class AnthropicMessagesTransport(BaseProvider):
                 stream_opened = False
                 try:
                     response = await self._global_rate_limiter.execute_with_retry(
-                        self._validated_stream_send, body, req_tag=req_tag
+                        self._validated_stream_send,
+                        body,
+                        req_tag=req_tag,
+                        api_key=self._api_key,
                     )
                     stream_opened = True
 
@@ -679,9 +685,22 @@ class AnthropicMessagesTransport(BaseProvider):
                                 yield event
                             return
 
-                    if not isinstance(error, httpx.HTTPStatusError):
+                    response_status = getattr(
+                        getattr(error, "response", None), "status_code", None
+                    )
+                    should_log_transport_error = not isinstance(
+                        error, httpx.HTTPStatusError
+                    ) or (
+                        isinstance(response_status, int)
+                        and (response_status == 429 or response_status >= 500)
+                    )
+                    if should_log_transport_error:
                         self._log_stream_transport_error(
-                            tag, req_tag, error, request_id=request_id
+                            tag,
+                            req_tag,
+                            error,
+                            request_id=request_id,
+                            api_key=self._api_key,
                         )
                     error_message = self._get_error_message(error, request_id)
 

@@ -759,14 +759,13 @@ class TestStreamingExceptionHandling:
             return_value=stream_mock,
         ):
             # Mock execute_with_retry to pass through to the actual function
-            async def _passthrough(fn, *args, **kwargs):
-                return await fn(*args, **kwargs)
+            from tests.rate_limit_mocks import passthrough_execute_with_retry
 
             with patch.object(
                 provider._global_rate_limiter,
                 "execute_with_retry",
                 new_callable=AsyncMock,
-                side_effect=_passthrough,
+                side_effect=passthrough_execute_with_retry,
             ):
                 events = await _collect_stream(provider, request)
 

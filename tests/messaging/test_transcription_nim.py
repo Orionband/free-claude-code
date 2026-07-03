@@ -41,7 +41,9 @@ def test_transcribe_audio_file_picks_one_comma_separated_key(tmp_path: Path) -> 
     riva_pkg = MagicMock()
     riva_pkg.client = riva_client
 
-    with patch("providers.nvidia_nim.voice.pick_nvidia_nim_api_key", return_value="key-b"):
+    with patch(
+        "providers.nvidia_nim.voice.pick_nvidia_nim_api_key", return_value="key-b"
+    ):
         with patch.dict(sys.modules, {"riva": riva_pkg, "riva.client": riva_client}):
             out = transcribe_audio_file(
                 wav,

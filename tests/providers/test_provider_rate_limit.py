@@ -262,6 +262,48 @@ class TestProviderRateLimiter:
         assert call_count == 2
 
     @pytest.mark.asyncio
+    async def test_execute_with_retry_logs_api_key_on_429(self, caplog):
+        """429 retry warnings include the upstream api_key when provided."""
+        import logging
+
+        import openai
+        from httpx import Request, Response
+
+        GlobalRateLimiter.reset_instance()
+        limiter = GlobalRateLimiter.get_instance(rate_limit=100, rate_window=60)
+
+        def make_429():
+            return openai.RateLimitError(
+                "rate limited",
+                response=Response(429, request=Request("POST", "http://x")),
+                body={},
+            )
+
+        call_count = 0
+
+        async def fail_then_ok():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise make_429()
+            return "ok"
+
+        with caplog.at_level(logging.WARNING):
+            result = await limiter.execute_with_retry(
+                fail_then_ok,
+                max_retries=2,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0,
+                api_key="nvapi-test-key-1",
+            )
+
+        assert result == "ok"
+        assert any(
+            "api_key=nvapi-test-key-1" in record.message for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
     async def test_execute_with_retry_succeeds_on_httpx_429(self):
         """HTTP 429 as httpx.HTTPStatusError then success returns result."""
         import httpx

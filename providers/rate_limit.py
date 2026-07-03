@@ -13,6 +13,7 @@ from loguru import logger
 
 from core.rate_limit import StrictSlidingWindowLimiter
 from core.trace import trace_event
+from providers.log_context import format_api_key_for_log
 
 T = TypeVar("T")
 
@@ -231,6 +232,7 @@ class GlobalRateLimiter:
         base_delay: float = 2.0,
         max_delay: float = 60.0,
         jitter: float = 1.0,
+        api_key: str | None = None,
         **kwargs: Any,
     ) -> Any:
         """Execute an async callable with rate limiting and retry on transient limits.
@@ -245,6 +247,7 @@ class GlobalRateLimiter:
             base_delay: Base delay in seconds for exponential backoff.
             max_delay: Maximum delay cap in seconds.
             jitter: Maximum random jitter in seconds added to each delay.
+            api_key: Upstream credential to include in retry log lines.
 
         Returns:
             The result of the callable.
@@ -254,6 +257,7 @@ class GlobalRateLimiter:
         """
         last_exc: Exception | None = None
         total_attempts = 1 + max_retries
+        key_tag = format_api_key_for_log(api_key)
 
         for attempt in range(total_attempts):
             await self.wait_if_blocked()
@@ -273,8 +277,9 @@ class GlobalRateLimiter:
                 last_exc = e
                 if attempt >= max_retries:
                     logger.warning(
-                        "{} retry exhausted after {} retries (attempts={})",
+                        "{}{} retry exhausted after {} retries (attempts={})",
                         label,
+                        key_tag,
                         max_retries,
                         total_attempts,
                     )
@@ -284,8 +289,9 @@ class GlobalRateLimiter:
                 delay += random.uniform(0, jitter)
                 attempt_no = attempt + 1
                 logger.warning(
-                    "{}, attempt {}/{}. Retrying in {:.1f}s...",
+                    "{}{}, attempt {}/{}. Retrying in {:.1f}s...",
                     label,
+                    key_tag,
                     attempt_no,
                     total_attempts,
                     delay,
@@ -298,6 +304,7 @@ class GlobalRateLimiter:
                     attempt=attempt_no,
                     max_attempts=total_attempts,
                     delay_s=round(delay, 3),
+                    api_key=api_key or None,
                 )
                 self.set_blocked(delay)
                 await asyncio.sleep(delay)
