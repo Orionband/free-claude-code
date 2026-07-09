@@ -1,5 +1,5 @@
 import json
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import openai
 import pytest
@@ -145,6 +145,7 @@ async def test_init_builds_client_per_comma_separated_api_key():
 @pytest.mark.asyncio
 async def test_openai_client_rotates_across_configured_keys():
     from providers.base import ProviderConfig
+    from providers.nvidia_nim.keys import FairRoundRobin
 
     config = ProviderConfig(
         api_key="key-a,key-b",
@@ -154,16 +155,18 @@ async def test_openai_client_rotates_across_configured_keys():
         provider = NvidiaNimProvider(config, nim_settings=NimSettings())
 
     first, second = object(), object()
-    with patch.object(provider, "_clients", (first, second)):
-        with patch(
-            "providers.nvidia_nim.client.random.choice",
-            side_effect=[first, second, first],
-        ) as choice:
-            assert provider._openai_client() is first
-            assert provider._openai_client() is second
-            assert provider._openai_client() is first
-
-    assert choice.call_args_list == [call((first, second))] * 3
+    provider._clients = (first, second)
+    provider._client_cycle = FairRoundRobin((first, second))
+    with patch(
+        "providers.nvidia_nim.keys.random.randrange",
+        side_effect=[1, 0, 0, 0],
+    ):
+        # round 1: [first,second] -> second; [first] -> first
+        assert provider._openai_client() is second
+        assert provider._openai_client() is first
+        # round 2: [first,second] -> first; [second] -> second
+        assert provider._openai_client() is first
+        assert provider._openai_client() is second
 
 
 @pytest.mark.asyncio

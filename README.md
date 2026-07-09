@@ -116,7 +116,7 @@ Pick one provider, enter its key or local URL in the Admin UI, and set `MODEL` t
 
 Get a key at [build.nvidia.com/settings/api-keys](https://build.nvidia.com/settings/api-keys).
 
-In the Admin UI, paste it into `NVIDIA_NIM_API_KEY`. The default `MODEL` is `nvidia_nim/nvidia/nemotron-3-super-120b-a12b`.
+In the Admin UI, paste it into `NVIDIA_NIM_API_KEY`. Comma-separate multiple keys (`key-a,key-b,key-c`) to fair-cycle them: each key is used once before any repeats (random start each round) to spread rate limits. The default `MODEL` is `nvidia_nim/nvidia/nemotron-3-super-120b-a12b`.
 
 Popular examples:
 

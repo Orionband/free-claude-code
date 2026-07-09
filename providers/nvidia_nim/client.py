@@ -1,7 +1,6 @@
 """NVIDIA NIM provider implementation."""
 
 import json
-import random
 from typing import Any
 
 import httpx
@@ -14,7 +13,7 @@ from providers.base import ProviderConfig
 from providers.defaults import NVIDIA_NIM_DEFAULT_BASE
 from providers.openai_compat import OpenAIChatTransport
 
-from .keys import parse_nvidia_nim_api_keys
+from .keys import FairRoundRobin, parse_nvidia_nim_api_keys
 from .request import (
     body_without_nim_tool_argument_aliases,
     build_request_body,
@@ -64,9 +63,10 @@ class NvidiaNimProvider(OpenAIChatTransport):
             self._clients: tuple[AsyncOpenAI, ...] = (self._client, *extra_clients)
         else:
             self._clients = (self._client,)
+        self._client_cycle = FairRoundRobin(self._clients)
 
     def _openai_client(self) -> AsyncOpenAI:
-        return random.choice(self._clients)
+        return self._client_cycle.next()
 
     async def cleanup(self) -> None:
         seen: set[int] = set()

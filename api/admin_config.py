@@ -126,7 +126,8 @@ FIELDS: tuple[ConfigFieldSpec, ...] = (
         secret=True,
         description=(
             "Used by NVIDIA NIM chat and optional NIM voice transcription. "
-            "Comma-separated values rotate randomly per request to spread rate limits."
+            "Comma-separated values fair-cycle (each key once per round; random "
+            "start) to spread rate limits."
         ),
     ),
     ConfigFieldSpec(
