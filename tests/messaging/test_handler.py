@@ -1,16 +1,29 @@
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from messaging.handler import ClaudeMessageHandler
-from messaging.models import IncomingMessage
-from messaging.trees.data import MessageNode, MessageTree
-from messaging.trees.queue_manager import MessageState
+from free_claude_code.messaging.models import IncomingMessage
+from free_claude_code.messaging.trees import (
+    CancellationReason,
+    CancellationUiOwner,
+    CancelledNode,
+    MessageNode,
+    MessageState,
+    MessageTree,
+    TreeQueueManager,
+)
+from free_claude_code.messaging.workflow import MessagingWorkflow
 
 
 @pytest.fixture
 def handler(mock_platform, mock_cli_manager, mock_session_store):
-    return ClaudeMessageHandler(mock_platform, mock_cli_manager, mock_session_store)
+    return MessagingWorkflow(
+        mock_platform,
+        mock_cli_manager,
+        mock_session_store,
+        voice_cancellation=mock_platform,
+    )
 
 
 @pytest.mark.asyncio
@@ -19,7 +32,7 @@ async def test_handle_message_turn_trace_includes_full_message_text(
 ):
     """turn.received always records the verbatim user message (local debugging)."""
     secret = "user-message-content-visible-in-trace"
-    handler = ClaudeMessageHandler(
+    handler = MessagingWorkflow(
         mock_platform,
         mock_cli_manager,
         mock_session_store,
@@ -27,8 +40,8 @@ async def test_handle_message_turn_trace_includes_full_message_text(
     )
     incoming = incoming_message_factory(text=secret)
     with (
-        patch.object(handler, "_handle_message_impl", new_callable=AsyncMock),
-        patch("messaging.handler.trace_event") as trace_mock,
+        patch.object(handler.turn_intake, "handle_message", new_callable=AsyncMock),
+        patch("free_claude_code.messaging.workflow.trace_event") as trace_mock,
     ):
         await handler.handle_message(incoming)
     kwargs = trace_mock.call_args.kwargs
@@ -42,7 +55,7 @@ async def test_handle_message_log_raw_messaging_does_not_change_turn_received_sh
 ):
     """LOG_RAW_MESSAGING_CONTENT is adapter-only; ingress TRACE always includes text."""
     text = "visible-either-way"
-    handler = ClaudeMessageHandler(
+    handler = MessagingWorkflow(
         mock_platform,
         mock_cli_manager,
         mock_session_store,
@@ -50,8 +63,8 @@ async def test_handle_message_log_raw_messaging_does_not_change_turn_received_sh
     )
     incoming = incoming_message_factory(text=text)
     with (
-        patch.object(handler, "_handle_message_impl", new_callable=AsyncMock),
-        patch("messaging.handler.trace_event") as trace_mock,
+        patch.object(handler.turn_intake, "handle_message", new_callable=AsyncMock),
+        patch("free_claude_code.messaging.workflow.trace_event") as trace_mock,
     ):
         await handler.handle_message(incoming)
     assert trace_mock.call_args.kwargs["message_text"] == text
@@ -59,7 +72,7 @@ async def test_handle_message_log_raw_messaging_does_not_change_turn_received_sh
 
 def test_get_initial_status_new_conversation(handler):
     """New conversation always returns launching message."""
-    result = handler._get_initial_status(None, None)
+    result = handler.turn_intake._get_initial_status(None, None)
     assert "Launching" in result
 
 
@@ -69,7 +82,7 @@ def test_get_initial_status_reply_tree_busy_queued(handler):
     mock_queue.is_node_tree_busy.return_value = True
     mock_queue.get_queue_size.return_value = 2
     handler.replace_tree_queue(mock_queue)
-    result = handler._get_initial_status(MagicMock(), "parent_1")
+    result = handler.turn_intake._get_initial_status(MagicMock(), "parent_1")
     assert "Queued" in result
     assert "position 3" in result
 
@@ -79,7 +92,7 @@ def test_get_initial_status_reply_tree_not_busy_continuing(handler):
     mock_queue = MagicMock()
     mock_queue.is_node_tree_busy.return_value = False
     handler.replace_tree_queue(mock_queue)
-    result = handler._get_initial_status(MagicMock(), "parent_1")
+    result = handler.turn_intake._get_initial_status(MagicMock(), "parent_1")
     assert "Continuing" in result
 
 
@@ -207,14 +220,14 @@ async def test_handle_message_new_conversation(
     ):
         mock_tree = MagicMock()
         mock_tree.root_id = "root_1"
-        mock_tree.to_dict.return_value = {"data": "tree"}
+        mock_tree.snapshot.return_value = {"data": "tree"}
         mock_create.return_value = mock_tree
 
         await handler.handle_message(incoming)
 
         mock_create.assert_called_once()
         mock_enqueue.assert_called_once()
-        mock_session_store.save_tree.assert_called_once_with("root_1", {"data": "tree"})
+        mock_session_store.save_tree_snapshot.assert_called_once_with({"data": "tree"})
 
 
 @pytest.mark.asyncio
@@ -229,7 +242,7 @@ async def test_handle_message_queued(handler, mock_platform, incoming_message_fa
     ):
         mock_tree = MagicMock()
         mock_tree.root_id = "root_1"
-        mock_tree.to_dict.return_value = {}
+        mock_tree.snapshot.return_value = {}
         mock_create.return_value = mock_tree
 
         await handler.handle_message(incoming)
@@ -352,13 +365,85 @@ async def test_stop_all_tasks(handler, mock_cli_manager, mock_platform):
     mock_node.status_message_id = "status_1"
 
     with patch.object(
-        handler.tree_queue, "cancel_all", AsyncMock(return_value=[mock_node])
-    ):
+        handler.tree_queue,
+        "cancel_all",
+        AsyncMock(
+            return_value=[CancelledNode(mock_node, CancellationUiOwner.WORKFLOW)]
+        ),
+    ) as cancel_all:
         count = await handler.stop_all_tasks()
 
         assert count == 1
+        cancel_all.assert_awaited_once_with(reason=CancellationReason.STOP)
         mock_cli_manager.stop_all.assert_called_once()
         mock_platform.fire_and_forget.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_all_tasks_skips_direct_edit_for_active_runner_owned_node(
+    handler, mock_cli_manager, mock_platform
+):
+    """Active node cleanup owns transcript-preserving stopped rendering."""
+    incoming = IncomingMessage(
+        text="work",
+        chat_id="chat_1",
+        user_id="user_1",
+        message_id="node_1",
+        platform="telegram",
+    )
+    node = MessageNode(
+        node_id="node_1", incoming=incoming, status_message_id="status_1"
+    )
+    tree = MagicMock()
+    tree.root_id = "root_1"
+    tree.snapshot.return_value = {"root": "snapshot"}
+
+    with (
+        patch.object(
+            handler.tree_queue,
+            "cancel_all",
+            AsyncMock(return_value=[CancelledNode(node, CancellationUiOwner.RUNNER)]),
+        ),
+        patch.object(
+            handler.tree_queue, "get_tree_for_node", MagicMock(return_value=tree)
+        ),
+    ):
+        count = await handler.stop_all_tasks()
+
+    assert count == 1
+    mock_cli_manager.stop_all.assert_called_once()
+    mock_platform.fire_and_forget.assert_not_called()
+    mock_platform.queue_edit_message.assert_not_called()
+    handler.session_store.save_tree_snapshot.assert_called_once_with(
+        {"root": "snapshot"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_all_tasks_edits_queued_workflow_owned_node(
+    handler, mock_cli_manager, mock_platform
+):
+    """Queued nodes have no transcript owner, so workflow renders simple stop."""
+    incoming = IncomingMessage(
+        text="queued",
+        chat_id="chat_1",
+        user_id="user_1",
+        message_id="node_1",
+        platform="telegram",
+    )
+    node = MessageNode(
+        node_id="node_1", incoming=incoming, status_message_id="status_1"
+    )
+
+    with patch.object(
+        handler.tree_queue,
+        "cancel_all",
+        AsyncMock(return_value=[CancelledNode(node, CancellationUiOwner.WORKFLOW)]),
+    ):
+        count = await handler.stop_all_tasks()
+
+    assert count == 1
+    mock_platform.fire_and_forget.assert_called_once()
 
 
 async def mock_async_gen(events):
@@ -367,7 +452,9 @@ async def mock_async_gen(events):
 
 
 @pytest.mark.asyncio
-async def test_process_node_success_flow(handler, mock_cli_manager, mock_platform):
+async def test_node_runner_process_node_success_flow(
+    handler, mock_cli_manager, mock_platform
+):
     # Setup
     node_id = "node_1"
     mock_node = MagicMock()
@@ -400,12 +487,12 @@ async def test_process_node_success_flow(handler, mock_cli_manager, mock_platfor
     mock_tree = MagicMock()
     mock_tree.update_state = AsyncMock()
     mock_tree.root_id = "root_1"
-    mock_tree.to_dict.return_value = {}
+    mock_tree.snapshot.return_value = {}
 
     with patch.object(
         handler.tree_queue, "get_tree_for_node", MagicMock(return_value=mock_tree)
     ):
-        await handler._process_node(node_id, mock_node)
+        await handler.node_runner.process_node(node_id, mock_node)
 
         # Verify state updates
         mock_tree.update_state.assert_any_call(node_id, MessageState.IN_PROGRESS)
@@ -428,7 +515,7 @@ async def test_process_node_success_flow(handler, mock_cli_manager, mock_platfor
 
 
 @pytest.mark.asyncio
-async def test_process_node_reply_uses_parent_session_for_manager_and_fork(
+async def test_node_runner_process_node_reply_uses_parent_session_for_manager_and_fork(
     handler, mock_cli_manager, mock_platform
 ):
     """Telegram follow-ups must reuse parent Claude session (issue #233)."""
@@ -451,13 +538,13 @@ async def test_process_node_reply_uses_parent_session_for_manager_and_fork(
     mock_tree = MagicMock()
     mock_tree.update_state = AsyncMock()
     mock_tree.root_id = "root_msg"
-    mock_tree.to_dict.return_value = {}
+    mock_tree.snapshot.return_value = {}
     mock_tree.get_parent_session_id = MagicMock(return_value=parent_claude_session)
 
     with patch.object(
         handler.tree_queue, "get_tree_for_node", MagicMock(return_value=mock_tree)
     ):
-        await handler._process_node(node_id, mock_node)
+        await handler.node_runner.process_node(node_id, mock_node)
 
     mock_tree.get_parent_session_id.assert_called_once_with(node_id)
     mock_cli_manager.get_or_create_session.assert_awaited_once_with(
@@ -470,7 +557,9 @@ async def test_process_node_reply_uses_parent_session_for_manager_and_fork(
 
 
 @pytest.mark.asyncio
-async def test_process_node_error_flow(handler, mock_cli_manager, mock_platform):
+async def test_node_runner_process_node_error_flow(
+    handler, mock_cli_manager, mock_platform
+):
     node_id = "node_1"
     mock_node = MagicMock()
     mock_node.incoming.chat_id = "chat_1"
@@ -487,6 +576,8 @@ async def test_process_node_error_flow(handler, mock_cli_manager, mock_platform)
     )
 
     mock_tree = MagicMock()
+    mock_tree.root_id = "root_1"
+    mock_tree.snapshot.return_value = {"data": "tree"}
     mock_tree.update_state = AsyncMock()
 
     with (
@@ -497,15 +588,186 @@ async def test_process_node_error_flow(handler, mock_cli_manager, mock_platform)
             handler.tree_queue, "mark_node_error", AsyncMock(return_value=[mock_node])
         ),
     ):
-        await handler._process_node(node_id, mock_node)
+        await handler.node_runner.process_node(node_id, mock_node)
 
         handler.tree_queue.mark_node_error.assert_called_once_with(
             node_id, "CLI crashed", propagate_to_children=True
+        )
+        handler.session_store.save_tree_snapshot.assert_called_once_with(
+            {"data": "tree"}
         )
 
         last_call = mock_platform.queue_edit_message.call_args_list[-1]
         assert "❌ *Error*" in last_call[0][2]
         assert "CLI crashed" in last_call[0][2]
+
+
+@pytest.mark.asyncio
+async def test_node_runner_process_node_provider_error_exit_does_not_complete(
+    handler, mock_cli_manager, mock_platform
+):
+    node_id = "node_1"
+    mock_node = MagicMock()
+    mock_node.incoming.chat_id = "chat_1"
+    mock_node.incoming.text = "hello"
+    mock_node.status_message_id = "status_1"
+    mock_node.parent_id = None
+
+    mock_session = MagicMock()
+    events = [
+        {
+            "type": "error",
+            "error": {
+                "message": "API Error: Request rejected (429)\nProvider rate limit reached."
+            },
+        },
+        {"type": "exit", "code": 1},
+    ]
+    mock_session.start_task.return_value = mock_async_gen(events)
+    mock_cli_manager.get_or_create_session.return_value = (
+        mock_session,
+        "session_1",
+        False,
+    )
+
+    mock_tree = MagicMock()
+    mock_tree.root_id = "root_1"
+    mock_tree.snapshot.return_value = {"data": "tree"}
+    mock_tree.update_state = AsyncMock()
+
+    with (
+        patch.object(
+            handler.tree_queue, "get_tree_for_node", MagicMock(return_value=mock_tree)
+        ),
+        patch.object(
+            handler.tree_queue, "mark_node_error", AsyncMock(return_value=[mock_node])
+        ) as mark_node_error,
+    ):
+        await handler.node_runner.process_node(node_id, mock_node)
+
+    mark_node_error.assert_called_once_with(
+        node_id,
+        "API Error: Request rejected (429)\nProvider rate limit reached.",
+        propagate_to_children=True,
+    )
+    mock_tree.update_state.assert_any_call(node_id, MessageState.IN_PROGRESS)
+    assert not any(
+        call.args == (node_id, MessageState.COMPLETED)
+        or (
+            len(call.args) >= 2
+            and call.args[0] == node_id
+            and call.args[1] is MessageState.COMPLETED
+        )
+        for call in mock_tree.update_state.call_args_list
+    )
+
+    rendered = mock_platform.queue_edit_message.call_args_list[-1].args[2]
+    assert "❌ *Error*" in rendered
+    assert "API Error: Request rejected" in rendered
+    assert "Process exited with code" not in rendered
+    assert "✅ *Complete*" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_node_runner_process_node_success_complete_wins_after_non_exit_error(
+    handler, mock_cli_manager, mock_platform
+):
+    node_id = "node_1"
+    mock_node = MagicMock()
+    mock_node.incoming.chat_id = "chat_1"
+    mock_node.incoming.text = "hello"
+    mock_node.status_message_id = "status_1"
+    mock_node.parent_id = None
+
+    mock_session = MagicMock()
+    events = [
+        {"type": "error", "error": {"message": "recoverable warning"}},
+        {"type": "exit", "code": 0},
+    ]
+    mock_session.start_task.return_value = mock_async_gen(events)
+    mock_cli_manager.get_or_create_session.return_value = (
+        mock_session,
+        "session_1",
+        False,
+    )
+
+    mock_tree = MagicMock()
+    mock_tree.root_id = "root_1"
+    mock_tree.snapshot.return_value = {"data": "tree"}
+    mock_tree.update_state = AsyncMock()
+
+    with (
+        patch.object(
+            handler.tree_queue, "get_tree_for_node", MagicMock(return_value=mock_tree)
+        ),
+        patch.object(
+            handler.tree_queue, "mark_node_error", AsyncMock(return_value=[mock_node])
+        ) as mark_node_error,
+    ):
+        await handler.node_runner.process_node(node_id, mock_node)
+
+    mark_node_error.assert_called_once_with(
+        node_id,
+        "recoverable warning",
+        propagate_to_children=True,
+    )
+    mock_tree.update_state.assert_any_call(
+        node_id, MessageState.COMPLETED, session_id="session_1"
+    )
+    rendered = mock_platform.queue_edit_message.call_args_list[-1].args[2]
+    assert "✅ *Complete*" in rendered
+
+
+@pytest.mark.asyncio
+async def test_node_runner_stop_cancellation_preserves_transcript(
+    handler, mock_cli_manager, mock_platform
+):
+    started = asyncio.Event()
+
+    async def start_task(*args, **kwargs):
+        yield {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "partial answer"}]},
+        }
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise
+
+    mock_session = MagicMock()
+    mock_session.start_task = start_task
+    mock_cli_manager.get_or_create_session.return_value = (
+        mock_session,
+        "session_1",
+        False,
+    )
+
+    incoming = IncomingMessage(
+        text="work",
+        chat_id="chat_1",
+        user_id="user_1",
+        message_id="node_1",
+        platform="telegram",
+    )
+    node = MessageNode(
+        node_id="node_1", incoming=incoming, status_message_id="status_1"
+    )
+    node.set_context({"cancel_reason": "stop"})
+
+    tree = await handler.tree_queue.create_tree("node_1", incoming, "status_1")
+    task = asyncio.create_task(handler.node_runner.process_node("node_1", node))
+    await started.wait()
+
+    task.cancel()
+    await task
+
+    last_call = mock_platform.queue_edit_message.call_args_list[-1]
+    rendered = last_call.args[2]
+    assert "partial answer" in rendered
+    assert "⏹ *Stopped\\.*" in rendered
+    assert rendered.index("partial answer") < rendered.index("⏹ *Stopped\\.*")
+    assert tree.get_node("node_1").state == MessageState.ERROR
 
 
 @pytest.mark.asyncio
@@ -544,11 +806,11 @@ async def test_handle_message_clear_command_stops_deletes_and_wipes_state(
         events.append("stop")
         return 0
 
-    async def _del(chat_id, message_id, fire_and_forget=True):
-        events.append(f"del:{chat_id}:{message_id}:{fire_and_forget}")
+    async def _del_many(chat_id, message_ids, fire_and_forget=True):
+        events.append(("del", chat_id, tuple(message_ids), fire_and_forget))
 
     handler.stop_all_tasks = AsyncMock(side_effect=_stop)
-    mock_platform.queue_delete_message = AsyncMock(side_effect=_del)
+    mock_platform.queue_delete_messages = AsyncMock(side_effect=_del_many)
 
     incoming = incoming_message_factory(
         text="/clear", chat_id="chat_1", message_id="150"
@@ -556,9 +818,9 @@ async def test_handle_message_clear_command_stops_deletes_and_wipes_state(
     await handler.handle_message(incoming)
 
     assert events and events[0] == "stop"
-    deleted_ids = {e.split(":")[2] for e in events[1:]}
+    deleted_ids = set(events[1][2])
     assert deleted_ids == {"100", "101", "150"}
-    assert all(e.endswith(":False") for e in events[1:])
+    assert events[1][3] is False
 
     mock_session_store.clear_all.assert_called_once()
     assert handler.tree_queue.get_tree_count() == 0
@@ -577,9 +839,9 @@ async def test_handle_message_clear_command_with_mention(
     await handler.handle_message(incoming)
 
     handler.stop_all_tasks.assert_called_once()
-    mock_platform.queue_delete_message.assert_called_once_with(
+    mock_platform.queue_delete_messages.assert_called_once_with(
         "chat_1",
-        "10",
+        ["10"],
         fire_and_forget=False,
     )
     mock_session_store.clear_all.assert_called_once()
@@ -597,8 +859,36 @@ async def test_handle_message_clear_command_deletes_message_log_ids(
     )
     await handler.handle_message(incoming)
 
-    deleted = {c.args[1] for c in mock_platform.queue_delete_message.call_args_list}
-    assert deleted == {"42", "43", "150"}
+    mock_platform.queue_delete_messages.assert_called_once_with(
+        "chat_1",
+        ["150", "43", "42"],
+        fire_and_forget=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_handle_message_clear_command_continues_after_delete_failure(
+    handler, mock_platform, mock_session_store, incoming_message_factory
+):
+    handler.stop_all_tasks = AsyncMock(return_value=0)
+    mock_session_store.get_message_ids_for_chat.return_value = ["41", "42", "43"]
+
+    async def delete_messages(chat_id, message_ids, fire_and_forget=True):
+        raise RuntimeError("platform rejected delete")
+
+    mock_platform.queue_delete_messages = AsyncMock(side_effect=delete_messages)
+
+    incoming = incoming_message_factory(
+        text="/clear", chat_id="chat_1", message_id="150"
+    )
+    await handler.handle_message(incoming)
+
+    mock_platform.queue_delete_messages.assert_called_once_with(
+        "chat_1",
+        ["150", "43", "42", "41"],
+        fire_and_forget=False,
+    )
+    mock_session_store.clear_all.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -629,10 +919,10 @@ async def test_handle_message_clear_command_reply_clears_branch(
 
     deleted_ids = []
 
-    async def _capture_delete(chat_id, message_id, fire_and_forget=True):
-        deleted_ids.append(message_id)
+    async def _capture_delete(chat_id, message_ids, fire_and_forget=True):
+        deleted_ids.extend(message_ids)
 
-    mock_platform.queue_delete_message = AsyncMock(side_effect=_capture_delete)
+    mock_platform.queue_delete_messages = AsyncMock(side_effect=_capture_delete)
 
     incoming = incoming_message_factory(
         text="/clear",
@@ -645,7 +935,10 @@ async def test_handle_message_clear_command_reply_clears_branch(
     assert set(deleted_ids) == {"102", "103", "150"}
     assert "100" not in deleted_ids
     assert "101" not in deleted_ids
-    mock_session_store.remove_node_mappings.assert_called()
+    mock_session_store.save_tree_snapshot.assert_called()
+    mock_session_store.forget_message_ids.assert_called_once_with(
+        "telegram", "chat_1", {"102", "103", "150"}
+    )
     assert handler.tree_queue.get_tree_for_node("102") is None
     assert handler.tree_queue.get_tree_for_node("100") is not None
 
@@ -683,10 +976,10 @@ async def test_handle_message_clear_command_reply_to_root_clears_tree(
 
     deleted_ids = []
 
-    async def _capture_delete(chat_id, message_id, fire_and_forget=True):
-        deleted_ids.append(message_id)
+    async def _capture_delete(chat_id, message_ids, fire_and_forget=True):
+        deleted_ids.extend(message_ids)
 
-    mock_platform.queue_delete_message = AsyncMock(side_effect=_capture_delete)
+    mock_platform.queue_delete_messages = AsyncMock(side_effect=_capture_delete)
 
     incoming = incoming_message_factory(
         text="/clear",
@@ -697,8 +990,55 @@ async def test_handle_message_clear_command_reply_to_root_clears_tree(
     await handler.handle_message(incoming)
 
     assert set(deleted_ids) == {"100", "101", "150"}
-    mock_session_store.remove_tree.assert_called_once_with("100")
+    mock_session_store.remove_tree_snapshot.assert_called_once_with("100")
+    mock_session_store.forget_message_ids.assert_called_once_with(
+        "telegram", "chat_1", {"100", "101", "150"}
+    )
     assert handler.tree_queue.get_tree_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_node_runner_does_not_save_after_clear_replaces_queue(
+    handler, mock_cli_manager, mock_session_store, incoming_message_factory
+):
+    """Late cancellation cleanup must not restore a tree after /clear reset."""
+    started = asyncio.Event()
+
+    async def start_task(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            raise
+        if False:
+            yield {}
+
+    cli_session = MagicMock()
+    cli_session.start_task = start_task
+    mock_cli_manager.get_or_create_session.return_value = (
+        cli_session,
+        "pending_1",
+        True,
+    )
+
+    incoming = incoming_message_factory(text="work", chat_id="chat_1", message_id="100")
+    tree = await handler.tree_queue.create_tree("100", incoming, "101")
+    node = tree.get_node("100")
+    assert node is not None
+
+    task = asyncio.create_task(handler.node_runner.process_node("100", node))
+    await started.wait()
+    handler.replace_tree_queue(
+        TreeQueueManager(
+            queue_update_callback=handler.update_queue_positions,
+            node_started_callback=handler.mark_node_processing,
+        )
+    )
+
+    task.cancel()
+    await task
+
+    mock_session_store.save_tree_snapshot.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -713,13 +1053,12 @@ async def test_handle_message_clear_command_reply_pending_voice_cancels(
         return None
 
     mock_platform.cancel_pending_voice = AsyncMock(side_effect=cancel_pending)
-    mock_platform.queue_delete_message = AsyncMock()
     deleted_ids = []
 
-    async def _capture_delete(chat_id, message_id, fire_and_forget=True):
-        deleted_ids.append(message_id)
+    async def _capture_delete(chat_id, message_ids, fire_and_forget=True):
+        deleted_ids.extend(message_ids)
 
-    mock_platform.queue_delete_message = AsyncMock(side_effect=_capture_delete)
+    mock_platform.queue_delete_messages = AsyncMock(side_effect=_capture_delete)
 
     incoming = incoming_message_factory(
         text="/clear",

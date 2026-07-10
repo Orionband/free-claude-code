@@ -1,11 +1,9 @@
-from __future__ import annotations
-
 import time
 
 import httpx
 import pytest
 
-from core.anthropic.stream_contracts import (
+from free_claude_code.core.anthropic.stream_contracts import (
     assert_anthropic_stream_contract,
     text_content,
     thinking_content,

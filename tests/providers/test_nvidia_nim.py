@@ -5,10 +5,13 @@ import openai
 import pytest
 from httpx import Request, Response
 
-from config.nim import NimSettings
-from providers.defaults import NVIDIA_NIM_DEFAULT_BASE
-from providers.nvidia_nim import NvidiaNimProvider
-from providers.nvidia_nim.request import NIM_TOOL_ARGUMENT_ALIASES_KEY
+from free_claude_code.config.nim import NimSettings
+from free_claude_code.providers.defaults import NVIDIA_NIM_DEFAULT_BASE
+from free_claude_code.providers.exceptions import ProviderError
+from free_claude_code.providers.nvidia_nim import NvidiaNimProvider
+from free_claude_code.providers.nvidia_nim.tool_schema import (
+    NIM_TOOL_ARGUMENT_ALIASES_KEY,
+)
 
 
 # Mock data classes
@@ -97,10 +100,27 @@ def _make_bad_request_error(message: str) -> openai.BadRequestError:
     return openai.BadRequestError(message, response=response, body=body)
 
 
+def _make_internal_server_error(message: str) -> openai.InternalServerError:
+    response = Response(
+        status_code=500,
+        request=Request("POST", f"{NVIDIA_NIM_DEFAULT_BASE}/chat/completions"),
+    )
+    body = {
+        "error": {
+            "message": message,
+            "type": "internal_server_error",
+            "code": 500,
+        }
+    }
+    return openai.InternalServerError(message, response=response, body=body)
+
+
 @pytest.fixture(autouse=True)
 def mock_rate_limiter():
     """Mock the global rate limiter to prevent waiting."""
-    with patch("providers.openai_compat.GlobalRateLimiter") as mock:
+    with patch(
+        "free_claude_code.providers.transports.openai_chat.transport.GlobalRateLimiter"
+    ) as mock:
         instance = mock.get_scoped_instance.return_value
         instance.wait_if_blocked = AsyncMock(return_value=False)
 
@@ -116,7 +136,9 @@ def mock_rate_limiter():
 @pytest.mark.asyncio
 async def test_init(provider_config):
     """Test provider initialization."""
-    with patch("providers.openai_compat.AsyncOpenAI") as mock_openai:
+    with patch(
+        "free_claude_code.providers.transports.openai_chat.transport.AsyncOpenAI"
+    ) as mock_openai:
         provider = NvidiaNimProvider(provider_config, nim_settings=NimSettings())
         assert provider._api_key == "test_key"
         assert provider._base_url == "https://test.api.nvidia.com/v1"
@@ -126,13 +148,15 @@ async def test_init(provider_config):
 @pytest.mark.asyncio
 async def test_init_builds_client_per_comma_separated_api_key():
     """Multiple NVIDIA keys create one OpenAI client per key."""
-    from providers.base import ProviderConfig
+    from free_claude_code.providers.base import ProviderConfig
 
     config = ProviderConfig(
         api_key="key-a,key-b,key-c",
         base_url="https://test.api.nvidia.com/v1",
     )
-    with patch("providers.openai_compat.AsyncOpenAI") as mock_openai:
+    with patch(
+        "free_claude_code.providers.transports.openai_chat.transport.AsyncOpenAI"
+    ) as mock_openai:
         provider = NvidiaNimProvider(config, nim_settings=NimSettings())
 
     assert provider._api_keys == ("key-a", "key-b", "key-c")
@@ -144,21 +168,23 @@ async def test_init_builds_client_per_comma_separated_api_key():
 
 @pytest.mark.asyncio
 async def test_openai_client_rotates_across_configured_keys():
-    from providers.base import ProviderConfig
-    from providers.nvidia_nim.keys import FairRoundRobin
+    from free_claude_code.providers.base import ProviderConfig
+    from free_claude_code.providers.nvidia_nim.keys import FairRoundRobin
 
     config = ProviderConfig(
         api_key="key-a,key-b",
         base_url="https://test.api.nvidia.com/v1",
     )
-    with patch("providers.openai_compat.AsyncOpenAI"):
+    with patch(
+        "free_claude_code.providers.transports.openai_chat.transport.AsyncOpenAI"
+    ):
         provider = NvidiaNimProvider(config, nim_settings=NimSettings())
 
-    first, second = object(), object()
+    first, second = MagicMock(), MagicMock()
     provider._clients = (first, second)
     provider._client_cycle = FairRoundRobin((first, second))
     with patch(
-        "providers.nvidia_nim.keys.random.randrange",
+        "free_claude_code.providers.nvidia_nim.keys.random.randrange",
         side_effect=[1, 0, 0, 0],
     ):
         # round 1: [first,second] -> second; [first] -> first
@@ -172,7 +198,7 @@ async def test_openai_client_rotates_across_configured_keys():
 @pytest.mark.asyncio
 async def test_init_uses_configurable_timeouts():
     """Test that provider passes configurable read/write/connect timeouts to client."""
-    from providers.base import ProviderConfig
+    from free_claude_code.providers.base import ProviderConfig
 
     config = ProviderConfig(
         api_key="test_key",
@@ -181,7 +207,9 @@ async def test_init_uses_configurable_timeouts():
         http_write_timeout=15.0,
         http_connect_timeout=5.0,
     )
-    with patch("providers.openai_compat.AsyncOpenAI") as mock_openai:
+    with patch(
+        "free_claude_code.providers.transports.openai_chat.transport.AsyncOpenAI"
+    ) as mock_openai:
         NvidiaNimProvider(config, nim_settings=NimSettings())
         call_kwargs = mock_openai.call_args[1]
         timeout = call_kwargs["timeout"]
@@ -460,12 +488,58 @@ async def test_stream_response_retries_without_chat_template(provider_config):
     assert "reasoning_budget" not in first_extra
 
     assert "chat_template" not in second_extra
-    assert second_extra["chat_template_kwargs"] == {
+    assert "chat_template_kwargs" not in second_extra
+    assert "reasoning_budget" not in second_extra
+
+    event_text = "".join(events)
+    assert "event: error" not in event_text
+    assert "OK" in event_text
+
+
+@pytest.mark.asyncio
+async def test_stream_response_retries_without_chat_template_kwargs_issue_993(
+    provider_config,
+):
+    provider = NvidiaNimProvider(provider_config, nim_settings=NimSettings())
+    req = MockRequest(model="mistralai/mistral-small-4-119b-2603")
+
+    mock_chunk = MagicMock()
+    mock_chunk.choices = [
+        MagicMock(
+            delta=MagicMock(content="OK", reasoning_content=""),
+            finish_reason="stop",
+        )
+    ]
+    mock_chunk.usage = MagicMock(completion_tokens=2)
+
+    async def mock_stream():
+        yield mock_chunk
+
+    first_error = _make_bad_request_error(
+        "chat_template is not supported for Mistral tokenizers."
+    )
+
+    with patch.object(
+        provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.side_effect = [first_error, mock_stream()]
+
+        events = [e async for e in provider.stream_response(req)]
+
+    assert mock_create.await_count == 2
+
+    first_extra = mock_create.call_args_list[0].kwargs["extra_body"]
+    second_kwargs = mock_create.call_args_list[1].kwargs
+
+    assert "chat_template" not in first_extra
+    assert first_extra["chat_template_kwargs"] == {
         "thinking": True,
         "enable_thinking": True,
         "reasoning_budget": 100,
     }
-    assert "reasoning_budget" not in second_extra
+    second_extra = second_kwargs.get("extra_body") or {}
+    assert "chat_template" not in second_extra
+    assert "chat_template_kwargs" not in second_extra
 
     event_text = "".join(events)
     assert "event: error" not in event_text
@@ -485,12 +559,11 @@ async def test_stream_response_does_not_retry_unrelated_bad_request(provider_con
     ) as mock_create:
         mock_create.side_effect = _make_bad_request_error("unrelated bad request")
 
-        events = [e async for e in provider.stream_response(req)]
+        with pytest.raises(ProviderError) as exc_info:
+            [e async for e in provider.stream_response(req)]
 
     assert mock_create.await_count == 1
-    event_text = "".join(events)
-    assert "Invalid request sent to provider" in event_text
-    assert "event: message_stop" in event_text
+    assert "Invalid request sent to provider" in exc_info.value.message
 
 
 @pytest.mark.asyncio
@@ -760,6 +833,51 @@ async def test_stream_response_retries_without_reasoning_budget(nim_provider):
 
 
 @pytest.mark.asyncio
+async def test_stream_response_retries_without_budget_for_thinking_token_error(
+    nim_provider,
+):
+    req = MockRequest(model="meta/llama-3.3-70b-instruct")
+
+    mock_chunk = MagicMock()
+    mock_chunk.choices = [
+        MagicMock(
+            delta=MagicMock(content="Recovered", reasoning_content=""),
+            finish_reason="stop",
+        )
+    ]
+    mock_chunk.usage = MagicMock(completion_tokens=5)
+
+    async def mock_stream():
+        yield mock_chunk
+
+    error = _make_internal_server_error(
+        "ValueError: thinking_token_budget is set but reasoning_config is not "
+        "configured. Please set --reasoning-config to use thinking_token_budget."
+    )
+
+    with patch.object(
+        nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.side_effect = [error, mock_stream()]
+
+        events = [e async for e in nim_provider.stream_response(req)]
+
+    assert mock_create.await_count == 2
+    first_call = mock_create.await_args_list[0].kwargs
+    second_call = mock_create.await_args_list[1].kwargs
+    assert (
+        first_call["extra_body"]["chat_template_kwargs"]["reasoning_budget"]
+        == first_call["max_tokens"]
+    )
+    assert "reasoning_budget" not in second_call["extra_body"]
+    assert "reasoning_budget" not in second_call["extra_body"]["chat_template_kwargs"]
+    assert second_call["extra_body"]["chat_template_kwargs"]["thinking"] is True
+    assert second_call["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
+    assert any("Recovered" in event for event in events)
+    assert any("message_stop" in event for event in events)
+
+
+@pytest.mark.asyncio
 async def test_stream_response_retries_without_reasoning_content(nim_provider):
     req = MockRequest(
         system=None,
@@ -775,7 +893,17 @@ async def test_stream_response_retries_without_reasoning_content(nim_provider):
                         input={"value": "FCC_TOOL"},
                     ),
                 ],
-            )
+            ),
+            MockMessage(
+                "user",
+                [
+                    MockBlock(
+                        type="tool_result",
+                        tool_use_id="toolu_reasoning",
+                        content="result",
+                    )
+                ],
+            ),
         ],
     )
 
@@ -822,11 +950,11 @@ async def test_stream_response_bad_request_without_reasoning_budget_does_not_ret
     ) as mock_create:
         mock_create.side_effect = error
 
-        events = [e async for e in nim_provider.stream_response(req)]
+        with pytest.raises(ProviderError) as exc_info:
+            [e async for e in nim_provider.stream_response(req)]
 
     assert mock_create.await_count == 1
-    assert any("Invalid request sent to provider" in event for event in events)
-    assert any("message_stop" in event for event in events)
+    assert "Invalid request sent to provider" in exc_info.value.message
 
 
 def _make_auth_error() -> openai.AuthenticationError:
@@ -861,9 +989,50 @@ async def test_stream_response_auth_error_logs_api_key(caplog, provider_config):
             side_effect=_make_auth_error(),
         ),
         caplog.at_level(logging.WARNING),
+        pytest.raises(ProviderError),
     ):
         _ = [e async for e in provider.stream_response(req, request_id="req_test")]
 
     messages = " | ".join(r.getMessage() for r in caplog.records)
     assert "nvapi-bad-key" in messages
     assert "Authentication failed (401)" in messages
+
+
+@pytest.mark.asyncio
+async def test_stream_response_unrelated_internal_error_does_not_downgrade(
+    nim_provider,
+):
+    req = MockRequest()
+    error = _make_internal_server_error("unrelated internal provider failure")
+
+    with patch.object(
+        nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.side_effect = error
+
+        with pytest.raises(ProviderError) as exc_info:
+            [e async for e in nim_provider.stream_response(req)]
+
+    assert mock_create.await_count == 1
+    assert "Provider API request failed" in exc_info.value.message
+
+
+@pytest.mark.asyncio
+async def test_stream_response_internal_reasoning_content_error_does_not_downgrade(
+    nim_provider,
+):
+    req = MockRequest()
+    error = _make_internal_server_error(
+        "reasoning_content could not be processed by the upstream model"
+    )
+
+    with patch.object(
+        nim_provider._client.chat.completions, "create", new_callable=AsyncMock
+    ) as mock_create:
+        mock_create.side_effect = error
+
+        with pytest.raises(ProviderError) as exc_info:
+            [e async for e in nim_provider.stream_response(req)]
+
+    assert mock_create.await_count == 1
+    assert "Provider API request failed" in exc_info.value.message

@@ -6,8 +6,6 @@ product E2E scenario when that behavior is a user-facing product path. Liveness
 and route probes live in ``smoke/prereq`` and do not count as product coverage.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Literal
 
@@ -35,15 +33,12 @@ class FeatureCoverage:
 README_FEATURES: tuple[str, ...] = (
     "zero_cost_provider_access",
     "drop_in_claude_code_replacement",
+    "drop_in_codex_replacement",
     "provider_matrix",
     "per_model_mapping",
     "thinking_token_support",
     "heuristic_tool_parser",
-    "request_optimization",
-    "smart_rate_limiting",
     "discord_telegram_bot",
-    "subagent_control",
-    "extensible_provider_platform_abcs",
     "optional_authentication",
     "vscode_extension",
     "intellij_extension",
@@ -72,6 +67,7 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
         (
             "test_api_basic_conversation_e2e",
             "test_claude_cli_adaptive_thinking_e2e",
+            "test_claude_cli_provider_error_e2e",
             "test_nvidia_nim_cli_matrix_e2e",
             "test_openrouter_free_cli_matrix_e2e",
             "test_vscode_protocol_e2e",
@@ -85,6 +81,22 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
             "OPENROUTER_API_KEY",
         ),
         "skip real CLI when binary is absent; configured providers must pass",
+    ),
+    FeatureCoverage(
+        "drop_in_codex_replacement",
+        "OpenAI Responses API and Codex CLI adapter route through the proxy",
+        "readme",
+        (
+            "tests/api/test_openai_responses.py",
+            "tests/cli/test_entrypoints.py",
+            "tests/cli/test_codex_model_catalog.py",
+            "tests/core/openai_responses/test_sse.py",
+        ),
+        ("test_probe_and_models_routes",),
+        ("test_provider_codex_responses_text_e2e",),
+        ("api", "providers"),
+        ("configured provider credentials or local provider endpoint",),
+        "missing providers are missing_env unless FCC_ALLOW_NO_PROVIDER_SMOKE=1",
     ),
     FeatureCoverage(
         "provider_matrix",
@@ -158,7 +170,7 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
     FeatureCoverage(
         "request_optimization",
         "Local request optimizations return product responses without providers",
-        "readme",
+        "public_surface",
         (
             "tests/api/test_optimization_handlers.py",
             "tests/api/test_routes_optimizations.py",
@@ -172,13 +184,28 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
     FeatureCoverage(
         "smart_rate_limiting",
         "Disconnect and limiter cleanup preserve follow-up requests",
-        "readme",
+        "public_surface",
         ("tests/providers/test_provider_rate_limit.py",),
         ("test_client_disconnect_mid_stream_does_not_crash_server",),
         ("test_provider_disconnect_e2e",),
         ("rate_limit", "providers"),
         ("configured provider",),
         "upstream disconnects are skips only when classified upstream_unavailable",
+    ),
+    FeatureCoverage(
+        "provider_hot_swap",
+        "Provider config changes preserve active streams while new requests switch",
+        "public_surface",
+        (
+            "tests/runtime/test_provider_manager.py",
+            "tests/api/test_response_streams.py",
+            "tests/api/test_admin.py",
+        ),
+        (),
+        ("test_provider_hot_swap_preserves_inflight_stream_e2e",),
+        ("api",),
+        (),
+        "credential-free local fake upstreams make the scenario always runnable",
     ),
     FeatureCoverage(
         "discord_telegram_bot",
@@ -204,7 +231,7 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
     FeatureCoverage(
         "subagent_control",
         "Task-like tool output is rendered and controlled as foreground work",
-        "readme",
+        "public_surface",
         ("tests/providers/test_subagent_interception.py",),
         (),
         ("test_messaging_subagent_control_e2e",),
@@ -215,13 +242,13 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
     FeatureCoverage(
         "extensible_provider_platform_abcs",
         "Provider and platform factories expose built-in extension points",
-        "readme",
+        "public_surface",
         (
             "tests/contracts/test_feature_manifest.py",
-            "tests/providers/test_registry.py",
+            "tests/providers/test_provider_runtime.py",
         ),
         (),
-        ("test_provider_registry_e2e", "test_platform_factory_e2e"),
+        ("test_provider_runtime_config_e2e", "test_platform_factory_e2e"),
         ("extensibility",),
         (),
         "always runnable with isolated settings",
@@ -324,7 +351,7 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
         "provider_proxy_timeout_config",
         "Provider proxies and HTTP timeout settings reach provider config",
         "public_surface",
-        ("tests/api/test_dependencies.py", "tests/providers/test_registry.py"),
+        ("tests/api/test_dependencies.py", "tests/providers/test_provider_runtime.py"),
         (),
         ("test_proxy_timeout_config_e2e",),
         ("config",),
@@ -468,7 +495,7 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
     ),
     FeatureCoverage(
         "removed_env_migration",
-        "Removed env vars fail fast with migration guidance",
+        "Removed thinking env vars are ignored without changing defaults",
         "public_surface",
         ("tests/config/test_config.py",),
         (),
@@ -486,8 +513,12 @@ FEATURE_INVENTORY: tuple[FeatureCoverage, ...] = (
             "tests/providers/test_error_mapping.py",
         ),
         (),
-        ("test_api_error_shape_e2e", "test_provider_error_e2e"),
-        ("api", "providers"),
+        (
+            "test_api_error_shape_e2e",
+            "test_provider_error_e2e",
+            "test_claude_cli_provider_error_e2e",
+        ),
+        ("api", "providers", "cli"),
         ("configured provider for provider error scenario",),
         "invalid request path is required; provider error path requires provider",
     ),

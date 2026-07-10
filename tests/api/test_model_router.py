@@ -2,9 +2,13 @@ from unittest.mock import patch
 
 import pytest
 
-from api.model_router import ModelRouter
-from api.models.anthropic import Message, MessagesRequest, TokenCountRequest
-from config.settings import Settings
+from free_claude_code.api.model_router import ModelRouter
+from free_claude_code.api.models.anthropic import (
+    Message,
+    MessagesRequest,
+    TokenCountRequest,
+)
+from free_claude_code.config.settings import Settings
 
 
 @pytest.fixture
@@ -124,6 +128,21 @@ def test_model_router_routes_wafer_provider_model_directly(settings):
     assert routed.resolved.provider_model_ref == "wafer/DeepSeek-V4-Pro"
 
 
+def test_model_router_routes_minimax_provider_model_directly(settings):
+    routed = ModelRouter(settings).resolve_messages_request(
+        MessagesRequest(
+            model="minimax/MiniMax-M3",
+            max_tokens=100,
+            messages=[Message(role="user", content="hello")],
+        )
+    )
+
+    assert routed.request.model == "MiniMax-M3"
+    assert routed.resolved.provider_id == "minimax"
+    assert routed.resolved.provider_model == "MiniMax-M3"
+    assert routed.resolved.provider_model_ref == "minimax/MiniMax-M3"
+
+
 def test_model_router_routes_gateway_encoded_provider_model_directly(settings):
     routed = ModelRouter(settings).resolve_messages_request(
         MessagesRequest(
@@ -192,7 +211,7 @@ def test_model_router_routes_token_count_request(settings):
 
 
 def test_model_router_logs_mapping(settings):
-    with patch("api.model_router.logger.debug") as mock_log:
+    with patch("free_claude_code.api.model_router.logger.debug") as mock_log:
         ModelRouter(settings).resolve("claude-2.1")
 
     mock_log.assert_called()

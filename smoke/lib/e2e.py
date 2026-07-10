@@ -1,7 +1,5 @@
 """Reusable product E2E smoke drivers."""
 
-from __future__ import annotations
-
 import asyncio
 import json
 import os
@@ -9,7 +7,7 @@ import subprocess
 import time
 import uuid
 import wave
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator, Sequence
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,8 +16,8 @@ from typing import Any
 import httpx
 import pytest
 
-from config.provider_ids import SUPPORTED_PROVIDER_IDS
-from core.anthropic.stream_contracts import (
+from free_claude_code.config.provider_ids import SUPPORTED_PROVIDER_IDS
+from free_claude_code.core.anthropic.stream_contracts import (
     SSEEvent,
     assert_anthropic_stream_contract,
     event_index,
@@ -27,10 +25,10 @@ from core.anthropic.stream_contracts import (
     parse_sse_lines,
     text_content,
 )
-from messaging.handler import ClaudeMessageHandler
-from messaging.models import IncomingMessage
-from messaging.platforms.base import MessagingPlatform
-from messaging.session import SessionStore
+from free_claude_code.messaging.models import IncomingMessage
+from free_claude_code.messaging.session import SessionStore
+from free_claude_code.messaging.workflow import MessagingWorkflow
+from smoke.lib.child_process import run_captured_text
 from smoke.lib.config import ProviderModel, SmokeConfig, auth_headers
 from smoke.lib.server import RunningServer, start_server
 from smoke.lib.skips import fail_missing_env
@@ -277,36 +275,39 @@ class ClientProtocolDriver:
         config: SmokeConfig,
         cwd: Path,
         prompt: str,
+        model: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["ANTHROPIC_BASE_URL"] = server.base_url
         env["ANTHROPIC_API_URL"] = f"{server.base_url}/v1"
+        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
         env.pop("ANTHROPIC_API_KEY", None)
         if config.settings.anthropic_auth_token:
             env["ANTHROPIC_AUTH_TOKEN"] = config.settings.anthropic_auth_token
         else:
             env.pop("ANTHROPIC_AUTH_TOKEN", None)
-        return subprocess.run(
-            [
-                claude_bin,
-                "--bare",
-                "--tools",
-                "",
-                "--system-prompt",
-                "Reply with exactly the requested smoke token and no other text.",
-                "-p",
-                prompt,
-            ],
+        command = [
+            claude_bin,
+            "--bare",
+            "--no-session-persistence",
+            "--tools",
+            "",
+            "--system-prompt",
+            "Reply with exactly the requested smoke token and no other text.",
+        ]
+        if model is not None:
+            command.extend(["--model", model])
+        command.extend(["-p", prompt])
+        return run_captured_text(
+            command,
             cwd=cwd,
             env=env,
-            capture_output=True,
-            text=True,
             timeout=config.timeout_s,
             check=False,
         )
 
 
-class FakePlatform(MessagingPlatform):
+class FakePlatform:
     """In-memory platform that exercises the real message handler."""
 
     def __init__(self, name: str) -> None:
@@ -412,22 +413,14 @@ class FakePlatform(MessagingPlatform):
     ) -> None:
         await self.edit_message(chat_id, message_id, text, parse_mode=parse_mode)
 
-    async def queue_delete_message(
-        self,
-        chat_id: str,
-        message_id: str,
-        fire_and_forget: bool = True,
-    ) -> None:
-        await self.delete_message(chat_id, message_id)
-
     async def queue_delete_messages(
         self,
         chat_id: str,
-        message_ids: Sequence[str],
+        message_ids: list[str],
         fire_and_forget: bool = True,
     ) -> None:
         for message_id in message_ids:
-            await self.queue_delete_message(chat_id, message_id, fire_and_forget=False)
+            await self.delete_message(chat_id, message_id)
 
     def register_pending_voice(
         self, chat_id: str, voice_message_id: str, status_message_id: str
@@ -438,9 +431,9 @@ class FakePlatform(MessagingPlatform):
         )
 
     async def cancel_pending_voice(
-        self, chat_id: str, voice_message_id: str
+        self, chat_id: str, reply_id: str
     ) -> tuple[str, str] | None:
-        return self._pending_voice.pop((chat_id, voice_message_id), None)
+        return self._pending_voice.pop((chat_id, reply_id), None)
 
 
 class FakeCLISession:
@@ -506,7 +499,7 @@ class FakePlatformDriver:
     platform: FakePlatform = field(init=False)
     cli_manager: FakeCLIManager = field(init=False)
     session_store: SessionStore = field(init=False)
-    handler: ClaudeMessageHandler = field(init=False)
+    workflow: MessagingWorkflow = field(init=False)
 
     def __post_init__(self) -> None:
         self.platform = FakePlatform(self.platform_name)
@@ -514,10 +507,14 @@ class FakePlatformDriver:
         self.session_store = SessionStore(
             storage_path=str(self.tmp_path / f"{self.platform_name}-sessions.json")
         )
-        self.handler = ClaudeMessageHandler(
-            self.platform, self.cli_manager, self.session_store
+        self.workflow = MessagingWorkflow(
+            self.platform,
+            self.cli_manager,
+            self.session_store,
+            platform_name=self.platform_name,
+            voice_cancellation=self.platform,
         )
-        self.platform.on_message(self.handler.handle_message)
+        self.platform.on_message(self.workflow.handle_message)
 
     async def send(
         self,
@@ -549,12 +546,9 @@ class FakePlatformDriver:
         raise AssertionError("fake platform did not become idle")
 
     def _all_tree_nodes_terminal(self) -> bool:
-        data = self.handler.tree_queue.to_dict()
-        for tree in data.get("trees", {}).values():
-            nodes = tree.get("nodes", {}) if isinstance(tree, dict) else {}
-            for node in nodes.values():
-                if not isinstance(node, dict):
-                    continue
+        snapshot = self.workflow.tree_queue.snapshot()
+        for tree in snapshot.trees.values():
+            for node in tree.nodes.values():
                 if node.get("state") in {"pending", "in_progress"}:
                     return False
         return True

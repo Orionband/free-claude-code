@@ -1,16 +1,13 @@
-from __future__ import annotations
-
 from typing import Any
 
 import httpx
 import pytest
 
-from config.provider_catalog import PROVIDER_CATALOG
-from core.anthropic.stream_contracts import (
+from free_claude_code.api.model_router import ModelRouter
+from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
+from free_claude_code.core.anthropic.stream_contracts import (
     SSEEvent,
-    assert_anthropic_stream_contract,
     parse_sse_lines,
-    text_content,
 )
 from smoke.lib.config import ProviderModel, SmokeConfig, auth_headers
 from smoke.lib.e2e import (
@@ -106,6 +103,30 @@ def test_provider_reasoning_tool_continuation_e2e(
     )
 
 
+def test_mistral_native_reasoning_model_e2e(smoke_config: SmokeConfig) -> None:
+    provider_model = smoke_config.mistral_reasoning_smoke_model()
+    if provider_model is None:
+        pytest.skip("missing_env: mistral is not configured")
+
+    payload = {
+        "model": "claude-opus-4-7",
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": "Reply with one short sentence."}],
+        "thinking": {"type": "adaptive"},
+    }
+    with _server_for_provider(
+        smoke_config, provider_model, "mistral-native-reasoning"
+    ) as server:
+        turn = ConversationDriver(server, smoke_config).stream(payload)
+
+    _assert_provider_product_stream(turn.events)
+    event_text = "\n".join(event.raw for event in turn.events)
+    assert "thinking_delta" in event_text, (
+        f"{provider_model.source}={provider_model.full_model} completed without "
+        "native Mistral thinking output"
+    )
+
+
 @pytest.mark.smoke_target("rate_limit")
 def test_provider_disconnect_e2e(
     smoke_config: SmokeConfig, provider_model: ProviderModel
@@ -122,8 +143,9 @@ def test_provider_error_e2e(smoke_config: SmokeConfig) -> None:
             name=f"product-provider-error-{provider_model.provider}",
             env_overrides={"MODEL": broken_model, "MESSAGING_PLATFORM": "none"},
         ).run() as server,
-        httpx.stream(
-            "POST",
+        httpx.Client(timeout=smoke_config.timeout_s) as client,
+    ):
+        response = client.post(
             f"{server.base_url}/v1/messages",
             headers=auth_headers(),
             json={
@@ -131,13 +153,50 @@ def test_provider_error_e2e(smoke_config: SmokeConfig) -> None:
                 "max_tokens": 32,
                 "messages": [{"role": "user", "content": "hello"}],
             },
-            timeout=smoke_config.timeout_s,
-        ) as response,
-    ):
-        assert response.status_code == 200, response.read()
-        events = parse_sse_lines(response.iter_lines())
-    assert_anthropic_stream_contract(events, allow_error=True)
-    assert any(event.event == "error" for event in events) or text_content(events)
+        )
+
+    assert response.status_code >= 400
+    assert response.headers["content-type"].startswith("application/json")
+    assert response.headers["x-should-retry"] == "false"
+    payload = response.json()
+    assert payload["type"] == "error"
+    assert payload["error"]["type"]
+    assert payload["error"]["message"]
+    assert payload["request_id"] == response.headers["request-id"]
+
+
+def test_provider_codex_responses_text_e2e(
+    smoke_config: SmokeConfig, provider_model: ProviderModel
+) -> None:
+    try:
+        with (
+            _server_for_provider(
+                smoke_config, provider_model, "codex-responses"
+            ) as server,
+            httpx.stream(
+                "POST",
+                f"{server.base_url}/v1/responses",
+                headers=_openai_auth_headers(smoke_config),
+                json={
+                    "model": provider_model.full_model,
+                    "input": smoke_config.prompt,
+                    "max_output_tokens": 128,
+                    "stream": True,
+                },
+                timeout=smoke_config.timeout_s,
+            ) as response,
+        ):
+            assert response.status_code == 200, response.read()
+            events = parse_sse_lines(response.iter_lines())
+    except Exception as exc:
+        skip_if_upstream_unavailable_exception(exc)
+        raise
+
+    skip_if_upstream_unavailable_events(events)
+    names = [event.event for event in events]
+    assert names[0] == "response.created", names
+    assert names[-1] == "response.completed", names
+    assert any(event.event == "response.output_text.delta" for event in events), names
 
 
 def test_openrouter_native_e2e(smoke_config: SmokeConfig) -> None:
@@ -209,7 +268,9 @@ def _provider_smoke_thinking_enabled(
     descriptor = PROVIDER_CATALOG[provider_model.provider]
     return (
         "thinking" in descriptor.capabilities
-        and smoke_config.settings.resolve_thinking("claude-sonnet-4-5-20250929")
+        and ModelRouter(smoke_config.settings)
+        .resolve("claude-sonnet-4-5-20250929")
+        .thinking_enabled
     )
 
 
@@ -517,3 +578,11 @@ def _server_for_provider(
             "MESSAGING_PLATFORM": "none",
         },
     ).run()
+
+
+def _openai_auth_headers(smoke_config: SmokeConfig) -> dict[str, str]:
+    headers = {"content-type": "application/json"}
+    token = smoke_config.settings.anthropic_auth_token
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    return headers

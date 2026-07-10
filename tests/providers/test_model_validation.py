@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import asyncio
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
@@ -9,18 +7,23 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from config.nim import NimSettings
-from config.settings import Settings
-from providers.base import BaseProvider, ProviderConfig
-from providers.deepseek import DeepSeekProvider
-from providers.exceptions import ModelListResponseError, ServiceUnavailableError
-from providers.lmstudio import LMStudioProvider
-from providers.model_listing import ProviderModelInfo
-from providers.nvidia_nim import NvidiaNimProvider
-from providers.ollama import OllamaProvider
-from providers.open_router import OpenRouterProvider
-from providers.registry import ProviderRegistry
-from providers.wafer import WaferProvider
+from free_claude_code.config.nim import NimSettings
+from free_claude_code.config.settings import Settings
+from free_claude_code.providers.base import BaseProvider, ProviderConfig
+from free_claude_code.providers.deepseek import DeepSeekProvider
+from free_claude_code.providers.exceptions import (
+    ModelListResponseError,
+    ServiceUnavailableError,
+)
+from free_claude_code.providers.llamacpp import LlamaCppProvider
+from free_claude_code.providers.model_listing import ProviderModelInfo
+from free_claude_code.providers.nvidia_nim import NvidiaNimProvider
+from free_claude_code.providers.ollama import OllamaProvider
+from free_claude_code.providers.open_router import OpenRouterProvider
+from free_claude_code.providers.runtime import ProviderRuntime
+from free_claude_code.providers.runtime.model_cache import ProviderModelCache
+from free_claude_code.providers.wafer import WaferProvider
+from free_claude_code.runtime.provider_manager import ProviderRuntimeManager
 
 
 def _settings(
@@ -51,6 +54,17 @@ def _settings(
     )
 
 
+def _manager(
+    settings: Settings,
+    providers: dict[str, BaseProvider] | None = None,
+) -> ProviderRuntimeManager:
+    providers = providers or {}
+    return ProviderRuntimeManager(
+        settings,
+        runtime_factory=lambda snapshot: ProviderRuntime(snapshot, dict(providers)),
+    )
+
+
 def _response(status_code: int, payload: object) -> httpx.Response:
     return httpx.Response(
         status_code,
@@ -62,7 +76,9 @@ def _response(status_code: int, payload: object) -> httpx.Response:
 @pytest.mark.asyncio
 async def test_nim_lists_openai_compatible_model_ids() -> None:
     config = ProviderConfig(api_key="test-key")
-    with patch("providers.openai_compat.AsyncOpenAI"):
+    with patch(
+        "free_claude_code.providers.transports.openai_chat.transport.AsyncOpenAI"
+    ):
         provider = NvidiaNimProvider(config, nim_settings=NimSettings())
 
     with patch.object(
@@ -75,9 +91,9 @@ async def test_nim_lists_openai_compatible_model_ids() -> None:
 
 
 @pytest.mark.asyncio
-async def test_native_openai_compatible_provider_lists_model_ids() -> None:
-    provider = LMStudioProvider(
-        ProviderConfig(api_key="lm-studio", base_url="http://localhost:1234/v1")
+async def test_native_anthropic_messages_provider_lists_model_ids() -> None:
+    provider = LlamaCppProvider(
+        ProviderConfig(api_key="llamacpp", base_url="http://localhost:8080/v1")
     )
     with patch.object(
         provider._client,
@@ -94,101 +110,88 @@ async def test_native_openai_compatible_provider_lists_model_ids() -> None:
 async def test_deepseek_lists_models_from_root_endpoint() -> None:
     provider = DeepSeekProvider(ProviderConfig(api_key="deepseek-key"))
     with patch.object(
-        provider._client,
-        "get",
+        provider._client.models,
+        "list",
         new_callable=AsyncMock,
-        return_value=_response(200, {"data": [{"id": "deepseek-chat"}]}),
-    ) as mock_get:
+        return_value=SimpleNamespace(data=[SimpleNamespace(id="deepseek-chat")]),
+    ) as mock_list:
         assert await provider.list_model_ids() == frozenset({"deepseek-chat"})
 
-    mock_get.assert_awaited_once_with(
-        "https://api.deepseek.com/models",
-        headers={"Authorization": "Bearer deepseek-key"},
-    )
+    mock_list.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
 async def test_wafer_lists_models_from_default_models_endpoint() -> None:
     provider = WaferProvider(ProviderConfig(api_key="wafer-key"))
     with patch.object(
-        provider._client,
-        "get",
+        provider._client.models,
+        "list",
         new_callable=AsyncMock,
-        return_value=_response(200, {"data": [{"id": "DeepSeek-V4-Pro"}]}),
-    ) as mock_get:
+        return_value=SimpleNamespace(data=[SimpleNamespace(id="DeepSeek-V4-Pro")]),
+    ) as mock_list:
         assert await provider.list_model_ids() == frozenset({"DeepSeek-V4-Pro"})
 
-    mock_get.assert_awaited_once_with(
-        "/models", headers={"Authorization": "Bearer wafer-key"}
-    )
+    mock_list.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
 async def test_openrouter_lists_only_tool_capable_models() -> None:
     provider = OpenRouterProvider(ProviderConfig(api_key="open-router-key"))
     with patch.object(
-        provider._client,
-        "get",
+        provider._client.models,
+        "list",
         new_callable=AsyncMock,
-        return_value=_response(
-            200,
-            {
-                "data": [
-                    {
-                        "id": "tool-model",
-                        "supported_parameters": ["tools", "max_tokens"],
-                    },
-                    {
-                        "id": "tool-choice-model",
-                        "supported_parameters": ["tool_choice"],
-                    },
-                    {
-                        "id": "chat-only",
-                        "supported_parameters": ["max_tokens", "temperature"],
-                    },
-                    {"id": "missing-metadata"},
-                ]
-            },
+        return_value=SimpleNamespace(
+            data=[
+                SimpleNamespace(
+                    id="tool-model",
+                    supported_parameters=["tools", "max_tokens"],
+                ),
+                SimpleNamespace(
+                    id="tool-choice-model",
+                    supported_parameters=["tool_choice"],
+                ),
+                SimpleNamespace(
+                    id="chat-only",
+                    supported_parameters=["max_tokens", "temperature"],
+                ),
+                SimpleNamespace(id="missing-metadata", supported_parameters=None),
+            ]
         ),
-    ) as mock_get:
+    ) as mock_list:
         assert await provider.list_model_ids() == frozenset(
             {"tool-model", "tool-choice-model"}
         )
 
-    mock_get.assert_awaited_once_with(
-        "/models", headers={"Authorization": "Bearer open-router-key"}
-    )
+    mock_list.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
 async def test_openrouter_lists_tool_metadata_with_thinking_support() -> None:
     provider = OpenRouterProvider(ProviderConfig(api_key="open-router-key"))
     with patch.object(
-        provider._client,
-        "get",
+        provider._client.models,
+        "list",
         new_callable=AsyncMock,
-        return_value=_response(
-            200,
-            {
-                "data": [
-                    {
-                        "id": "reasoning-tool-model",
-                        "supported_parameters": [
-                            "tools",
-                            "reasoning",
-                            "include_reasoning",
-                        ],
-                    },
-                    {
-                        "id": "plain-tool-model",
-                        "supported_parameters": ["tool_choice", "include_reasoning"],
-                    },
-                    {
-                        "id": "chat-only",
-                        "supported_parameters": ["reasoning", "max_tokens"],
-                    },
-                ]
-            },
+        return_value=SimpleNamespace(
+            data=[
+                SimpleNamespace(
+                    id="reasoning-tool-model",
+                    supported_parameters=[
+                        "tools",
+                        "reasoning",
+                        "include_reasoning",
+                    ],
+                ),
+                SimpleNamespace(
+                    id="plain-tool-model",
+                    supported_parameters=["tool_choice", "include_reasoning"],
+                ),
+                SimpleNamespace(
+                    id="chat-only",
+                    supported_parameters=["reasoning", "max_tokens"],
+                ),
+            ]
         ),
     ):
         infos = await provider.list_model_infos()
@@ -205,17 +208,14 @@ async def test_openrouter_lists_tool_metadata_with_thinking_support() -> None:
 async def test_openrouter_lists_empty_set_when_no_tool_capable_models() -> None:
     provider = OpenRouterProvider(ProviderConfig(api_key="open-router-key"))
     with patch.object(
-        provider._client,
-        "get",
+        provider._client.models,
+        "list",
         new_callable=AsyncMock,
-        return_value=_response(
-            200,
-            {
-                "data": [
-                    {"id": "chat-only", "supported_parameters": ["max_tokens"]},
-                    {"id": "missing-metadata"},
-                ]
-            },
+        return_value=SimpleNamespace(
+            data=[
+                SimpleNamespace(id="chat-only", supported_parameters=["max_tokens"]),
+                SimpleNamespace(id="missing-metadata", supported_parameters=None),
+            ]
         ),
     ):
         assert await provider.list_model_ids() == frozenset()
@@ -226,12 +226,11 @@ async def test_openrouter_model_metadata_rejects_malformed_ids() -> None:
     provider = OpenRouterProvider(ProviderConfig(api_key="open-router-key"))
     with (
         patch.object(
-            provider._client,
-            "get",
+            provider._client.models,
+            "list",
             new_callable=AsyncMock,
-            return_value=_response(
-                200,
-                {"data": [{"supported_parameters": ["tools", "reasoning"]}]},
+            return_value=SimpleNamespace(
+                data=[SimpleNamespace(supported_parameters=["tools", "reasoning"])]
             ),
         ),
         pytest.raises(ModelListResponseError, match="malformed"),
@@ -267,8 +266,8 @@ async def test_ollama_lists_native_tag_model_ids() -> None:
 
 @pytest.mark.asyncio
 async def test_model_listing_rejects_malformed_payload() -> None:
-    provider = LMStudioProvider(
-        ProviderConfig(api_key="lm-studio", base_url="http://localhost:1234/v1")
+    provider = LlamaCppProvider(
+        ProviderConfig(api_key="llamacpp", base_url="http://localhost:8080/v1")
     )
     with (
         patch.object(
@@ -284,8 +283,8 @@ async def test_model_listing_rejects_malformed_payload() -> None:
 
 @pytest.mark.asyncio
 async def test_model_listing_raises_http_status_errors() -> None:
-    provider = LMStudioProvider(
-        ProviderConfig(api_key="lm-studio", base_url="http://localhost:1234/v1")
+    provider = LlamaCppProvider(
+        ProviderConfig(api_key="llamacpp", base_url="http://localhost:8080/v1")
     )
     with (
         patch.object(
@@ -353,32 +352,34 @@ class FakeProvider(BaseProvider):
 
 
 @pytest.mark.asyncio
-async def test_registry_validation_succeeds_for_all_configured_models() -> None:
-    registry = ProviderRegistry(
+async def test_runtime_validation_succeeds_for_all_configured_models() -> None:
+    settings = _settings(model_opus="open_router/anthropic/claude-opus")
+    runtime = _manager(
+        settings,
         {
             "nvidia_nim": FakeProvider(frozenset({"nim-model"})),
             "open_router": FakeProvider(frozenset({"anthropic/claude-opus"})),
-        }
+        },
     )
-    settings = _settings(model_opus="open_router/anthropic/claude-opus")
 
-    await registry.validate_configured_models(settings)
+    await runtime.validate_configured_models()
 
-    assert registry.cached_model_ids() == {
+    assert runtime.cached_model_ids() == {
         "nvidia_nim": frozenset({"nim-model"}),
         "open_router": frozenset({"anthropic/claude-opus"}),
     }
 
 
 @pytest.mark.asyncio
-async def test_registry_validation_reports_missing_model_with_sources() -> None:
-    registry = ProviderRegistry(
-        {"nvidia_nim": FakeProvider(frozenset({"different-model"}))}
-    )
+async def test_runtime_validation_reports_missing_model_with_sources() -> None:
     settings = _settings(model_sonnet="nvidia_nim/nim-model")
+    runtime = _manager(
+        settings,
+        {"nvidia_nim": FakeProvider(frozenset({"different-model"}))},
+    )
 
     with pytest.raises(ServiceUnavailableError) as exc_info:
-        await registry.validate_configured_models(settings)
+        await runtime.validate_configured_models()
 
     message = exc_info.value.message
     assert "sources=MODEL,MODEL_SONNET" in message
@@ -388,19 +389,20 @@ async def test_registry_validation_reports_missing_model_with_sources() -> None:
 
 
 @pytest.mark.asyncio
-async def test_registry_validation_aggregates_multiple_failures() -> None:
-    registry = ProviderRegistry(
+async def test_runtime_validation_aggregates_multiple_failures() -> None:
+    settings = _settings(model_opus="open_router/anthropic/claude-opus")
+    runtime = _manager(
+        settings,
         {
             "nvidia_nim": FakeProvider(frozenset({"different-model"})),
             "open_router": FakeProvider(
                 error=ModelListResponseError("bad model-list shape")
             ),
-        }
+        },
     )
-    settings = _settings(model_opus="open_router/anthropic/claude-opus")
 
     with pytest.raises(ServiceUnavailableError) as exc_info:
-        await registry.validate_configured_models(settings)
+        await runtime.validate_configured_models()
 
     message = exc_info.value.message
     assert "sources=MODEL provider=nvidia_nim model=nim-model" in message
@@ -412,10 +414,12 @@ async def test_registry_validation_aggregates_multiple_failures() -> None:
 
 
 @pytest.mark.asyncio
-async def test_registry_validation_queries_providers_concurrently() -> None:
+async def test_runtime_validation_queries_providers_concurrently() -> None:
     nim_started = asyncio.Event()
     router_started = asyncio.Event()
-    registry = ProviderRegistry(
+    settings = _settings(model_opus="open_router/anthropic/claude-opus")
+    runtime = _manager(
+        settings,
         {
             "nvidia_nim": FakeProvider(
                 frozenset({"nim-model"}),
@@ -427,56 +431,60 @@ async def test_registry_validation_queries_providers_concurrently() -> None:
                 started=router_started,
                 peer_started=nim_started,
             ),
-        }
+        },
     )
-    settings = _settings(model_opus="open_router/anthropic/claude-opus")
 
-    await asyncio.wait_for(registry.validate_configured_models(settings), timeout=1.0)
+    await asyncio.wait_for(runtime.validate_configured_models(), timeout=1.0)
 
 
 @pytest.mark.asyncio
-async def test_registry_refresh_model_list_cache_uses_configured_remote_keys_and_referenced_local() -> (
+async def test_runtime_refresh_model_list_cache_uses_configured_remote_keys_and_referenced_local() -> (
     None
 ):
-    registry = ProviderRegistry(
-        {
-            "open_router": FakeProvider(frozenset({"anthropic/claude-sonnet"})),
-            "lmstudio": FakeProvider(frozenset({"local-qwen"})),
-            "ollama": FakeProvider(frozenset({"llama3.1"})),
-        }
-    )
     settings = _settings(
         model="lmstudio/local-qwen",
         open_router_api_key="open-router-key",
     )
+    runtime = _manager(
+        settings,
+        {
+            "open_router": FakeProvider(frozenset({"anthropic/claude-sonnet"})),
+            "lmstudio": FakeProvider(frozenset({"local-qwen"})),
+            "ollama": FakeProvider(frozenset({"llama3.1"})),
+        },
+    )
 
-    await registry.refresh_model_list_cache(settings)
+    await runtime.refresh_model_list_cache()
 
-    assert registry.cached_model_ids() == {
+    assert runtime.cached_model_ids() == {
         "open_router": frozenset({"anthropic/claude-sonnet"}),
         "lmstudio": frozenset({"local-qwen"}),
     }
 
 
 @pytest.mark.asyncio
-async def test_registry_refresh_model_list_cache_keeps_prior_cache_on_failure() -> None:
-    registry = ProviderRegistry(
-        {"nvidia_nim": FakeProvider(error=RuntimeError("upstream down"))}
-    )
-    registry.cache_model_ids("nvidia_nim", {"cached-model"})
+async def test_runtime_refresh_model_list_cache_keeps_prior_cache_on_failure() -> None:
     settings = _settings(
         model="nvidia_nim/cached-model",
         nvidia_nim_api_key="nim-key",
     )
+    runtime = _manager(
+        settings,
+        {"nvidia_nim": FakeProvider(error=RuntimeError("upstream down"))},
+    )
+    runtime.cache_model_infos(
+        "nvidia_nim",
+        {ProviderModelInfo("cached-model")},
+    )
 
-    await registry.refresh_model_list_cache(settings)
+    await runtime.refresh_model_list_cache()
 
-    assert registry.cached_model_ids() == {"nvidia_nim": frozenset({"cached-model"})}
+    assert runtime.cached_model_ids() == {"nvidia_nim": frozenset({"cached-model"})}
 
 
-def test_registry_metadata_cache_exposes_ids_and_prefixed_infos() -> None:
-    registry = ProviderRegistry()
-    registry.cache_model_infos(
+def test_runtime_metadata_cache_exposes_ids_and_prefixed_infos() -> None:
+    cache = ProviderModelCache()
+    cache.cache_model_infos(
         "open_router",
         {
             ProviderModelInfo("reasoning-model", supports_thinking=True),
@@ -484,39 +492,36 @@ def test_registry_metadata_cache_exposes_ids_and_prefixed_infos() -> None:
         },
     )
 
-    assert registry.cached_model_ids() == {
+    assert cache.cached_model_ids() == {
         "open_router": frozenset({"reasoning-model", "plain-model"})
     }
     assert (
-        registry.cached_model_supports_thinking("open_router", "reasoning-model")
-        is True
+        cache.cached_model_supports_thinking("open_router", "reasoning-model") is True
     )
-    assert (
-        registry.cached_model_supports_thinking("open_router", "plain-model") is False
-    )
-    assert registry.cached_prefixed_model_infos() == (
+    assert cache.cached_model_supports_thinking("open_router", "plain-model") is False
+    assert cache.cached_prefixed_model_infos() == (
         ProviderModelInfo("open_router/plain-model", supports_thinking=False),
         ProviderModelInfo("open_router/reasoning-model", supports_thinking=True),
     )
 
 
-def test_registry_legacy_model_id_cache_keeps_unknown_thinking_support() -> None:
-    registry = ProviderRegistry()
-    registry.cache_model_ids("open_router", {"plain-model"})
+def test_runtime_model_id_cache_keeps_unknown_thinking_support() -> None:
+    cache = ProviderModelCache()
+    cache.cache_model_ids("open_router", {"plain-model"})
 
-    assert registry.cached_model_ids() == {"open_router": frozenset({"plain-model"})}
-    assert registry.cached_model_supports_thinking("open_router", "plain-model") is None
-    assert registry.cached_prefixed_model_infos() == (
+    assert cache.cached_model_ids() == {"open_router": frozenset({"plain-model"})}
+    assert cache.cached_model_supports_thinking("open_router", "plain-model") is None
+    assert cache.cached_prefixed_model_infos() == (
         ProviderModelInfo("open_router/plain-model", supports_thinking=None),
     )
 
 
-def test_registry_cached_prefixed_model_refs_are_deterministic() -> None:
-    registry = ProviderRegistry()
-    registry.cache_model_ids("deepseek", {"deepseek-chat"})
-    registry.cache_model_ids("open_router", {"z-model", "a-model"})
+def test_runtime_cached_prefixed_model_refs_are_deterministic() -> None:
+    cache = ProviderModelCache()
+    cache.cache_model_ids("deepseek", {"deepseek-chat"})
+    cache.cache_model_ids("open_router", {"z-model", "a-model"})
 
-    assert registry.cached_prefixed_model_refs() == (
+    assert cache.cached_prefixed_model_refs() == (
         "open_router/a-model",
         "open_router/z-model",
         "deepseek/deepseek-chat",

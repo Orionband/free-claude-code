@@ -1,11 +1,9 @@
-from __future__ import annotations
-
 import os
 from pathlib import Path
 
 import pytest
 
-from messaging.transcription import transcribe_audio
+from free_claude_code.messaging.transcription import transcribe_audio
 from smoke.lib.config import SmokeConfig
 from smoke.lib.e2e import VoiceFixtureDriver
 

@@ -1,6 +1,6 @@
 """Tests for provider log context helpers."""
 
-from providers.log_context import (
+from free_claude_code.providers.log_context import (
     resolve_upstream_api_key_for_log,
     should_log_upstream_transport_http_status,
     stamp_upstream_api_key_on_exception,

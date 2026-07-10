@@ -5,9 +5,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
-from providers.base import ProviderConfig
-from providers.ollama import OLLAMA_DEFAULT_BASE, OllamaProvider
-from tests.stream_contract import assert_canonical_stream_error_envelope
+from free_claude_code.core.anthropic.stream_contracts import parse_sse_text
+from free_claude_code.providers.base import ProviderConfig
+from free_claude_code.providers.exceptions import ProviderError
+from free_claude_code.providers.ollama import OLLAMA_DEFAULT_BASE, OllamaProvider
 
 
 class MockMessage:
@@ -63,7 +64,9 @@ def ollama_config():
 @pytest.fixture(autouse=True)
 def mock_rate_limiter():
     """Mock the global rate limiter to prevent waiting."""
-    with patch("providers.anthropic_messages.GlobalRateLimiter") as mock:
+    with patch(
+        "free_claude_code.providers.transports.anthropic_messages.transport.GlobalRateLimiter"
+    ) as mock:
         instance = mock.get_scoped_instance.return_value
         instance.wait_if_blocked = AsyncMock(return_value=False)
 
@@ -183,8 +186,12 @@ async def test_stream_response(ollama_provider):
     assert kwargs["json"]["stream"] is True
     assert "extra_body" not in kwargs["json"]
     assert kwargs["json"]["thinking"] == {"type": "enabled"}
-    assert len(events) == 9
-    assert events[0] == "event: message_start\n"
+    assert [event.event for event in parse_sse_text("".join(events))] == [
+        "message_start",
+        "content_block_delta",
+        "message_stop",
+    ]
+    assert "Hello World" in "".join(events)
 
 
 @pytest.mark.asyncio
@@ -227,7 +234,7 @@ def test_build_request_body_disabled_thinking_strips_assistant_thinking_blocks(
 
 @pytest.mark.asyncio
 async def test_stream_error_status_code(ollama_provider):
-    """Non-200 status code is yielded as an SSE API error."""
+    """Pre-start non-200 status code raises for API-level non-200 handling."""
     req = MockRequest()
     mock_response = MagicMock()
     mock_response.status_code = 500
@@ -248,16 +255,15 @@ async def test_stream_error_status_code(ollama_provider):
             new_callable=AsyncMock,
             return_value=mock_response,
         ),
+        pytest.raises(ProviderError) as exc_info,
     ):
-        events = [
+        [
             event
             async for event in ollama_provider.stream_response(req, request_id="REQ")
         ]
 
-    assert_canonical_stream_error_envelope(
-        events, user_message_substr="Provider API request failed"
-    )
-    assert "REQ" in "".join(events)
+    assert "Provider API request failed" in exc_info.value.message
+    assert "REQ" in exc_info.value.message
 
 
 @pytest.mark.asyncio

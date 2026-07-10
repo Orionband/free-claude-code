@@ -1,19 +1,81 @@
 import asyncio
 import time
+from unittest.mock import AsyncMock, patch
 
+import httpx
+import openai
 import pytest
 import pytest_asyncio
+from httpx import Request
 
-from providers.rate_limit import (
+from free_claude_code.providers.rate_limit import (
     DEFAULT_UPSTREAM_MAX_RETRIES,
     UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS,
     GlobalRateLimiter,
+    retryable_upstream_status,
+    retryable_upstream_transport_error,
 )
 
 
 def test_upstream_transient_retry_total_attempts_is_five() -> None:
     assert UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS == 5
     assert DEFAULT_UPSTREAM_MAX_RETRIES == 4
+
+
+def _statusless_api_error(message: str, body: object | None) -> openai.APIError:
+    return openai.APIError(message, request=Request("POST", "http://x"), body=body)
+
+
+def test_retryable_upstream_status_reads_statusless_api_error_body_status() -> None:
+    exc = _statusless_api_error(
+        "stream embedded error",
+        {"error": {"message": "internal failure", "code": 500}},
+    )
+
+    assert retryable_upstream_status(exc) == 500
+
+
+def test_retryable_upstream_status_reads_statusless_resource_exhausted_text() -> None:
+    exc = _statusless_api_error(
+        "ResourceExhausted: limit reached while generating response",
+        {"error": {"message": "ResourceExhausted: limit reached"}},
+    )
+
+    assert retryable_upstream_status(exc) == 503
+
+
+def test_retryable_upstream_transport_error_classifies_connection_failures() -> None:
+    request = Request("POST", "http://x")
+    assert retryable_upstream_transport_error(
+        openai.APIConnectionError(request=request)
+    )
+    assert retryable_upstream_transport_error(httpx.ConnectError("connect failed"))
+    assert retryable_upstream_transport_error(httpx.ReadError("read failed"))
+    assert retryable_upstream_transport_error(httpx.WriteError("write failed"))
+    assert retryable_upstream_transport_error(
+        httpx.RemoteProtocolError("server disconnected")
+    )
+    assert retryable_upstream_transport_error(TimeoutError("timed out"))
+
+
+def test_retryable_upstream_transport_error_rejects_request_errors() -> None:
+    from httpx import Response
+
+    request = Request("POST", "http://x")
+    assert not retryable_upstream_transport_error(
+        openai.BadRequestError(
+            "bad request",
+            response=Response(400, request=request),
+            body={},
+        )
+    )
+    assert not retryable_upstream_transport_error(
+        httpx.HTTPStatusError(
+            "bad request",
+            request=request,
+            response=Response(400, request=request),
+        )
+    )
 
 
 class TestProviderRateLimiter:
@@ -391,6 +453,121 @@ class TestProviderRateLimiter:
         )
         assert result == "ok"
         assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_execute_with_retry_succeeds_on_statusless_transient_api_error(self):
+        """Status-less SDK APIError transient markers participate in backoff retry."""
+        limiter = GlobalRateLimiter.get_instance(rate_limit=100, rate_window=60)
+
+        call_count = 0
+
+        async def fail_then_ok():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise _statusless_api_error(
+                    "ResourceExhausted: limit reached while generating response",
+                    {"error": {"message": "ResourceExhausted: limit reached"}},
+                )
+            return "ok"
+
+        result = await limiter.execute_with_retry(
+            fail_then_ok, max_retries=2, base_delay=0.01, max_delay=0.1, jitter=0
+        )
+
+        assert result == "ok"
+        assert call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_execute_with_retry_succeeds_on_openai_connection_retry(self):
+        """Pre-response OpenAI SDK connection errors retry then succeed."""
+        limiter = GlobalRateLimiter.get_instance(rate_limit=100, rate_window=60)
+
+        call_count = 0
+        request = Request("POST", "http://x")
+
+        async def fail_then_ok():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise openai.APIConnectionError(request=request)
+            return "ok"
+
+        with (
+            patch.object(limiter, "set_blocked") as set_blocked,
+            patch("asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            result = await limiter.execute_with_retry(
+                fail_then_ok,
+                max_retries=2,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0,
+            )
+
+        assert result == "ok"
+        assert call_count == 2
+        set_blocked.assert_not_called()
+        sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_execute_with_retry_succeeds_on_httpx_transport_retry(self):
+        """Pre-response HTTPX transport errors retry then succeed."""
+        limiter = GlobalRateLimiter.get_instance(rate_limit=100, rate_window=60)
+
+        call_count = 0
+
+        async def fail_then_ok():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise httpx.RemoteProtocolError("server disconnected")
+            return "ok"
+
+        with (
+            patch.object(limiter, "set_blocked") as set_blocked,
+            patch("asyncio.sleep", new_callable=AsyncMock) as sleep,
+        ):
+            result = await limiter.execute_with_retry(
+                fail_then_ok,
+                max_retries=2,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0,
+            )
+
+        assert result == "ok"
+        assert call_count == 2
+        set_blocked.assert_not_called()
+        sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_execute_with_retry_exhaust_transport_error_attempts(self):
+        """Transport retries exhaust after the shared 5 total attempts."""
+        limiter = GlobalRateLimiter.get_instance(rate_limit=100, rate_window=60)
+
+        call_count = 0
+
+        async def always_fail():
+            nonlocal call_count
+            call_count += 1
+            raise httpx.ConnectError("connect failed")
+
+        with (
+            patch.object(limiter, "set_blocked") as set_blocked,
+            patch("asyncio.sleep", new_callable=AsyncMock) as sleep,
+            pytest.raises(httpx.ConnectError),
+        ):
+            await limiter.execute_with_retry(
+                always_fail,
+                base_delay=0.01,
+                max_delay=0.1,
+                jitter=0,
+            )
+
+        assert call_count == UPSTREAM_TRANSIENT_TOTAL_ATTEMPTS
+        set_blocked.assert_not_called()
+        assert sleep.await_count == DEFAULT_UPSTREAM_MAX_RETRIES
 
     @pytest.mark.parametrize("status_code", [500, 502, 503, 504])
     @pytest.mark.asyncio

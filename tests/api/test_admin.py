@@ -1,15 +1,13 @@
-from __future__ import annotations
-
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 from fastapi.testclient import TestClient
 
-from api.admin_config import MASKED_SECRET
-from api.admin_urls import local_admin_url
-from api.app import create_app
-from config.settings import Settings
+from free_claude_code.config.admin.values import MASKED_SECRET
+from free_claude_code.config.server_urls import local_admin_url
+from free_claude_code.config.settings import Settings
+from tests.api.support import create_test_app
 
 
 def _local_client(app):
@@ -28,7 +26,12 @@ def _clear_process_config(monkeypatch) -> None:
         "NVIDIA_NIM_API_KEY",
         "OPENROUTER_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
+        "TELEGRAM_PROXY_URL",
         "FCC_ENV_FILE",
+        "CLOUDFLARE_API_TOKEN",
+        "CLOUDFLARE_ACCOUNT_ID",
+        "GITHUB_MODELS_TOKEN",
+        "SAMBANOVA_API_KEY",
         "HOST",
         "PORT",
         "LOG_FILE",
@@ -41,7 +44,7 @@ def _clear_process_config(monkeypatch) -> None:
 
 def test_admin_page_is_loopback_only(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     assert _local_client(app).get("/admin").status_code == 200
     remote_client = TestClient(app, client=("203.0.113.10", 50000))
@@ -50,7 +53,7 @@ def test_admin_page_is_loopback_only(monkeypatch, tmp_path):
 
 def test_admin_page_no_longer_renders_generated_env_panel(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).get("/admin")
 
@@ -61,7 +64,7 @@ def test_admin_page_no_longer_renders_generated_env_panel(monkeypatch, tmp_path)
 
 def test_admin_page_no_longer_renders_global_status_header(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).get("/admin")
 
@@ -72,7 +75,9 @@ def test_admin_page_no_longer_renders_global_status_header(monkeypatch, tmp_path
 
 
 def test_admin_static_no_longer_fetches_global_status_header():
-    script = Path("api/admin_static/admin.js").read_text(encoding="utf-8")
+    script = Path("src/free_claude_code/api/admin_static/admin.js").read_text(
+        encoding="utf-8"
+    )
 
     assert 'api("/admin/api/status")' not in script
     assert "updateHeader" not in script
@@ -82,7 +87,9 @@ def test_admin_static_no_longer_fetches_global_status_header():
 
 
 def test_admin_static_hides_managed_source_label():
-    script = Path("api/admin_static/admin.js").read_text(encoding="utf-8")
+    script = Path("src/free_claude_code/api/admin_static/admin.js").read_text(
+        encoding="utf-8"
+    )
 
     assert 'managed_env: "",' in script
     assert "hasOwnProperty.call(labels, source)" in script
@@ -93,7 +100,7 @@ def test_admin_static_hides_managed_source_label():
 def test_admin_config_masks_secrets_and_exposes_manifest(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
     _clear_process_config(monkeypatch)
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).get("/admin/api/config")
 
@@ -103,8 +110,13 @@ def test_admin_config_masks_secrets_and_exposes_manifest(monkeypatch, tmp_path):
     assert "ANTHROPIC_AUTH_TOKEN" in keys
     assert "OPENROUTER_API_KEY" in keys
     assert "FIREWORKS_API_KEY" in keys
+    assert "CLOUDFLARE_API_TOKEN" in keys
+    assert "CLOUDFLARE_ACCOUNT_ID" in keys
+    assert "GITHUB_MODELS_TOKEN" in keys
     assert "GEMINI_API_KEY" in keys
     assert "GROQ_API_KEY" in keys
+    assert "SAMBANOVA_API_KEY" in keys
+    assert "TELEGRAM_PROXY_URL" in keys
     assert "CEREBRAS_API_KEY" in keys
     assert "ZAI_BASE_URL" not in keys
     assert "CLAUDE_WORKSPACE" not in keys
@@ -120,6 +132,10 @@ def test_admin_config_masks_secrets_and_exposes_manifest(monkeypatch, tmp_path):
         field for field in body["fields"] if field["key"] == "NVIDIA_NIM_API_KEY"
     )
     assert "Comma-separated" in nim_field["description"]
+    telegram_proxy_field = next(
+        field for field in body["fields"] if field["key"] == "TELEGRAM_PROXY_URL"
+    )
+    assert telegram_proxy_field["secret"] is True
 
 
 def test_admin_config_preserves_managed_env_source_contract(monkeypatch, tmp_path):
@@ -128,7 +144,7 @@ def test_admin_config_preserves_managed_env_source_contract(monkeypatch, tmp_pat
     env_file = tmp_path / ".fcc" / ".env"
     env_file.parent.mkdir(parents=True)
     env_file.write_text("MODEL=open_router/managed-model\n", encoding="utf-8")
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).get("/admin/api/config")
 
@@ -139,10 +155,31 @@ def test_admin_config_preserves_managed_env_source_contract(monkeypatch, tmp_pat
     assert model_field["locked"] is False
 
 
+def test_admin_apply_masks_telegram_proxy_credentials(monkeypatch, tmp_path):
+    _set_home(monkeypatch, tmp_path)
+    _clear_process_config(monkeypatch)
+    app = create_test_app()
+    proxy_url = "https://user:password@proxy.example:8443"
+
+    response = _local_client(app).post(
+        "/admin/api/config/apply",
+        json={"values": {"TELEGRAM_PROXY_URL": proxy_url}},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["applied"] is True
+    assert "TELEGRAM_PROXY_URL=********" in body["env_preview"]
+    assert proxy_url not in body["env_preview"]
+    env_file = tmp_path / ".fcc" / ".env"
+    text = env_file.read_text(encoding="utf-8")
+    assert f"TELEGRAM_PROXY_URL={proxy_url}" in text
+
+
 def test_admin_validate_rejects_bad_model_shape(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
     _clear_process_config(monkeypatch)
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).post(
         "/admin/api/config/validate",
@@ -160,7 +197,7 @@ def test_admin_apply_writes_complete_managed_env_and_masks_preview(
 ):
     _set_home(monkeypatch, tmp_path)
     _clear_process_config(monkeypatch)
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).post(
         "/admin/api/config/apply",
@@ -192,7 +229,7 @@ def test_admin_apply_writes_complete_managed_env_and_masks_preview(
 def test_admin_apply_writes_fireworks_key_and_masks_preview(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
     _clear_process_config(monkeypatch)
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).post(
         "/admin/api/config/apply",
@@ -217,7 +254,7 @@ def test_admin_apply_writes_fireworks_key_and_masks_preview(monkeypatch, tmp_pat
 def test_admin_apply_writes_gemini_key_and_masks_preview(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
     _clear_process_config(monkeypatch)
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).post(
         "/admin/api/config/apply",
@@ -242,7 +279,7 @@ def test_admin_apply_writes_gemini_key_and_masks_preview(monkeypatch, tmp_path):
 def test_admin_apply_writes_groq_key_and_masks_preview(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
     _clear_process_config(monkeypatch)
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).post(
         "/admin/api/config/apply",
@@ -264,10 +301,35 @@ def test_admin_apply_writes_groq_key_and_masks_preview(monkeypatch, tmp_path):
     assert "GROQ_API_KEY=gq-secret" in text
 
 
+def test_admin_apply_writes_sambanova_key_and_masks_preview(monkeypatch, tmp_path):
+    _set_home(monkeypatch, tmp_path)
+    _clear_process_config(monkeypatch)
+    app = create_test_app()
+
+    response = _local_client(app).post(
+        "/admin/api/config/apply",
+        json={
+            "values": {
+                "MODEL": "sambanova/Meta-Llama-3.3-70B-Instruct",
+                "SAMBANOVA_API_KEY": "sn-secret",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["applied"] is True
+    assert "SAMBANOVA_API_KEY=********" in body["env_preview"]
+    env_file = tmp_path / ".fcc" / ".env"
+    text = env_file.read_text(encoding="utf-8")
+    assert "MODEL=sambanova/Meta-Llama-3.3-70B-Instruct" in text
+    assert "SAMBANOVA_API_KEY=sn-secret" in text
+
+
 def test_admin_apply_writes_cerebras_key_and_masks_preview(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
     _clear_process_config(monkeypatch)
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).post(
         "/admin/api/config/apply",
@@ -289,6 +351,111 @@ def test_admin_apply_writes_cerebras_key_and_masks_preview(monkeypatch, tmp_path
     assert "CEREBRAS_API_KEY=cb-secret" in text
 
 
+def test_admin_apply_writes_cloudflare_fields_and_masks_preview(monkeypatch, tmp_path):
+    _set_home(monkeypatch, tmp_path)
+    _clear_process_config(monkeypatch)
+    app = create_test_app()
+
+    response = _local_client(app).post(
+        "/admin/api/config/apply",
+        json={
+            "values": {
+                "MODEL": "cloudflare/@cf/moonshotai/kimi-k2.6",
+                "CLOUDFLARE_API_TOKEN": "cf-secret",
+                "CLOUDFLARE_ACCOUNT_ID": "cf-account",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["applied"] is True
+    assert "CLOUDFLARE_API_TOKEN=********" in body["env_preview"]
+    assert "CLOUDFLARE_ACCOUNT_ID=cf-account" in body["env_preview"]
+    env_file = tmp_path / ".fcc" / ".env"
+    text = env_file.read_text(encoding="utf-8")
+    assert "MODEL=cloudflare/@cf/moonshotai/kimi-k2.6" in text
+    assert "CLOUDFLARE_API_TOKEN=cf-secret" in text
+    assert "CLOUDFLARE_ACCOUNT_ID=cf-account" in text
+
+
+def test_admin_apply_writes_huggingface_key_and_masks_preview(monkeypatch, tmp_path):
+    _set_home(monkeypatch, tmp_path)
+    _clear_process_config(monkeypatch)
+    app = create_test_app()
+
+    response = _local_client(app).post(
+        "/admin/api/config/apply",
+        json={
+            "values": {
+                "MODEL": "huggingface/openai/gpt-oss-120b:fastest",
+                "HUGGINGFACE_API_KEY": "hf-secret",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["applied"] is True
+    assert "HUGGINGFACE_API_KEY=********" in body["env_preview"]
+    env_file = tmp_path / ".fcc" / ".env"
+    text = env_file.read_text(encoding="utf-8")
+    assert "MODEL=huggingface/openai/gpt-oss-120b:fastest" in text
+    assert "HUGGINGFACE_API_KEY=hf-secret" in text
+
+
+def test_admin_apply_writes_cohere_key_and_masks_preview(monkeypatch, tmp_path):
+    _set_home(monkeypatch, tmp_path)
+    _clear_process_config(monkeypatch)
+    app = create_test_app()
+
+    response = _local_client(app).post(
+        "/admin/api/config/apply",
+        json={
+            "values": {
+                "MODEL": "cohere/command-a-plus-05-2026",
+                "COHERE_API_KEY": "cohere-secret",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["applied"] is True
+    assert "COHERE_API_KEY=********" in body["env_preview"]
+    env_file = tmp_path / ".fcc" / ".env"
+    text = env_file.read_text(encoding="utf-8")
+    assert "MODEL=cohere/command-a-plus-05-2026" in text
+    assert "COHERE_API_KEY=cohere-secret" in text
+
+
+def test_admin_apply_writes_github_models_token_and_masks_preview(
+    monkeypatch, tmp_path
+):
+    _set_home(monkeypatch, tmp_path)
+    _clear_process_config(monkeypatch)
+    app = create_test_app()
+
+    response = _local_client(app).post(
+        "/admin/api/config/apply",
+        json={
+            "values": {
+                "MODEL": "github_models/openai/gpt-4.1",
+                "GITHUB_MODELS_TOKEN": "github-secret",
+            }
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["applied"] is True
+    assert "GITHUB_MODELS_TOKEN=********" in body["env_preview"]
+    env_file = tmp_path / ".fcc" / ".env"
+    text = env_file.read_text(encoding="utf-8")
+    assert "MODEL=github_models/openai/gpt-4.1" in text
+    assert "GITHUB_MODELS_TOKEN=github-secret" in text
+
+
 def test_admin_apply_preserves_hidden_diagnostics_and_smoke_values(
     monkeypatch, tmp_path
 ):
@@ -307,7 +474,7 @@ def test_admin_apply_preserves_hidden_diagnostics_and_smoke_values(
         ),
         encoding="utf-8",
     )
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).post(
         "/admin/api/config/apply",
@@ -331,7 +498,7 @@ def test_admin_apply_omits_stale_zai_base_url(monkeypatch, tmp_path):
     env_file.write_text(
         "\n".join(
             [
-                "MODEL=zai/glm-5.1",
+                "MODEL=zai/glm-5.2",
                 "ZAI_API_KEY=zai-secret",
                 "ZAI_BASE_URL=https://custom.zai.invalid/v1",
                 "",
@@ -339,11 +506,11 @@ def test_admin_apply_omits_stale_zai_base_url(monkeypatch, tmp_path):
         ),
         encoding="utf-8",
     )
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).post(
         "/admin/api/config/apply",
-        json={"values": {"MODEL": "zai/glm-5.1"}},
+        json={"values": {"MODEL": "zai/glm-5.2"}},
     )
 
     assert response.status_code == 200
@@ -370,7 +537,7 @@ def test_admin_apply_omits_stale_fixed_claude_runtime_settings(monkeypatch, tmp_
         ),
         encoding="utf-8",
     )
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).post(
         "/admin/api/config/apply",
@@ -389,13 +556,12 @@ def test_admin_apply_omits_stale_fixed_claude_runtime_settings(monkeypatch, tmp_
 def test_admin_apply_restart_required_reports_automatic_restart(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
     _clear_process_config(monkeypatch)
-    app = create_app(lifespan_enabled=False)
     callbacks: list[str] = []
 
     async def restart_callback() -> None:
         callbacks.append("restart")
 
-    app.state.admin_restart_callback = restart_callback
+    app = create_test_app(restart_callback=restart_callback)
 
     response = _local_client(app).post(
         "/admin/api/config/apply",
@@ -418,7 +584,7 @@ def test_admin_apply_restart_required_reports_automatic_restart(monkeypatch, tmp
 def test_admin_apply_restart_required_reports_manual_fallback(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
     _clear_process_config(monkeypatch)
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     response = _local_client(app).post(
         "/admin/api/config/apply",
@@ -441,7 +607,7 @@ def test_admin_process_env_values_are_locked_and_not_written(monkeypatch, tmp_pa
     _set_home(monkeypatch, tmp_path)
     _clear_process_config(monkeypatch)
     monkeypatch.setenv("MODEL", "open_router/process-model")
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     config = _local_client(app).get("/admin/api/config").json()
     model_field = next(field for field in config["fields"] if field["key"] == "MODEL")
@@ -466,7 +632,7 @@ def test_admin_first_apply_migrates_repo_env(monkeypatch, tmp_path):
         "MODEL=deepseek/deepseek-chat\nDEEPSEEK_API_KEY=deepseek-secret\n",
         encoding="utf-8",
     )
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     config = _local_client(app).get("/admin/api/config").json()
     model_field = next(field for field in config["fields"] if field["key"] == "MODEL")
@@ -487,7 +653,7 @@ def test_admin_first_apply_migrates_repo_env(monkeypatch, tmp_path):
 def test_admin_local_provider_status_reports_reachable(monkeypatch, tmp_path):
     _set_home(monkeypatch, tmp_path)
     _clear_process_config(monkeypatch)
-    app = create_app(lifespan_enabled=False)
+    app = create_test_app()
 
     class FakeAsyncClient:
         def __init__(self, *args, **kwargs):
@@ -502,7 +668,7 @@ def test_admin_local_provider_status_reports_reachable(monkeypatch, tmp_path):
         async def get(self, url: str):
             return httpx.Response(200, json={"data": []})
 
-    with patch("api.admin_routes.httpx.AsyncClient", FakeAsyncClient):
+    with patch("free_claude_code.api.admin_routes.httpx.AsyncClient", FakeAsyncClient):
         response = _local_client(app).get("/admin/api/providers/local-status")
 
     assert response.status_code == 200

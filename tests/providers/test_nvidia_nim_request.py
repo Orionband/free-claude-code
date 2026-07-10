@@ -1,4 +1,4 @@
-"""Tests for providers/nvidia_nim/request.py."""
+"""Tests for NVIDIA NIM request policy helpers."""
 
 from copy import deepcopy
 from types import SimpleNamespace
@@ -7,15 +7,21 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from config.nim import NimSettings
-from core.anthropic import set_if_not_none
-from providers.nvidia_nim.request import (
-    NIM_TOOL_ARGUMENT_ALIASES_KEY,
+from free_claude_code.config.nim import NimSettings
+from free_claude_code.core.anthropic import set_if_not_none
+from free_claude_code.providers.nvidia_nim.request_options import (
     _set_extra,
-    body_without_nim_tool_argument_aliases,
-    build_request_body,
+)
+from free_claude_code.providers.nvidia_nim.request_options import (
+    build_nim_request_body as build_request_body,
+)
+from free_claude_code.providers.nvidia_nim.retry import (
     clone_body_without_chat_template,
     clone_body_without_reasoning_content,
+)
+from free_claude_code.providers.nvidia_nim.tool_schema import (
+    NIM_TOOL_ARGUMENT_ALIASES_KEY,
+    body_without_nim_tool_argument_aliases,
     nim_tool_argument_aliases_from_body,
 )
 
@@ -312,13 +318,39 @@ class TestBuildRequestBody:
 
         assert cloned is not None
         assert "chat_template" not in cloned["extra_body"]
-        assert cloned["extra_body"]["chat_template_kwargs"] == {
+        assert "chat_template_kwargs" not in cloned["extra_body"]
+        assert cloned["extra_body"]["ignore_eos"] is False
+        assert body["extra_body"]["chat_template"] == "custom_template"
+        assert body["extra_body"]["chat_template_kwargs"] == {
             "thinking": True,
             "enable_thinking": True,
             "reasoning_budget": 100,
         }
+
+    def test_clone_body_without_chat_template_kwargs_only(self):
+        body = {
+            "model": "test",
+            "extra_body": {
+                "chat_template_kwargs": {
+                    "thinking": True,
+                    "enable_thinking": True,
+                    "reasoning_budget": 100,
+                },
+                "ignore_eos": False,
+            },
+        }
+
+        cloned = clone_body_without_chat_template(body)
+
+        assert cloned is not None
+        assert "chat_template" not in cloned["extra_body"]
+        assert "chat_template_kwargs" not in cloned["extra_body"]
         assert cloned["extra_body"]["ignore_eos"] is False
-        assert body["extra_body"]["chat_template"] == "custom_template"
+
+    def test_clone_body_without_chat_template_returns_none_when_unchanged(self):
+        body = {"model": "test", "extra_body": {"ignore_eos": False}}
+
+        assert clone_body_without_chat_template(body) is None
 
     def test_no_chat_template_kwargs_when_thinking_disabled(self):
         req = MagicMock()

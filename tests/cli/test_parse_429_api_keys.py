@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 
-from cli.parse_429_api_keys import (
+from free_claude_code.cli.managed.parse_429_api_keys import (
     filter_hits,
     iter_429_api_key_hits,
     iter_upstream_api_key_hits,

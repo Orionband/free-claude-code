@@ -1,18 +1,18 @@
 """Tests for NVIDIA NIM voice transcription wiring."""
 
-from __future__ import annotations
-
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from messaging.transcription import transcribe_audio
+from free_claude_code.messaging.transcription import transcribe_audio
 
 
 def test_transcribe_audio_nvidia_nim_forwards_api_key(tmp_path: Path) -> None:
     wav = tmp_path / "stub.wav"
     wav.write_bytes(b"\x00" * 128)
-    with patch("messaging.transcription.transcribe_nvidia_nim_audio") as nim_fn:
+    with patch(
+        "free_claude_code.messaging.transcription.transcribe_nvidia_nim_audio"
+    ) as nim_fn:
         nim_fn.return_value = "ok"
         out = transcribe_audio(
             wav,
@@ -28,7 +28,7 @@ def test_transcribe_audio_nvidia_nim_forwards_api_key(tmp_path: Path) -> None:
 
 
 def test_transcribe_audio_file_picks_one_comma_separated_key(tmp_path: Path) -> None:
-    from providers.nvidia_nim.voice import transcribe_audio_file
+    from free_claude_code.providers.nvidia_nim.voice import transcribe_audio_file
 
     wav = tmp_path / "stub.wav"
     wav.write_bytes(b"\x00" * 128)
@@ -41,15 +41,18 @@ def test_transcribe_audio_file_picks_one_comma_separated_key(tmp_path: Path) -> 
     riva_pkg = MagicMock()
     riva_pkg.client = riva_client
 
-    with patch(
-        "providers.nvidia_nim.voice.pick_nvidia_nim_api_key", return_value="key-b"
+    with (
+        patch(
+            "free_claude_code.providers.nvidia_nim.voice.pick_nvidia_nim_api_key",
+            return_value="key-b",
+        ),
+        patch.dict(sys.modules, {"riva": riva_pkg, "riva.client": riva_client}),
     ):
-        with patch.dict(sys.modules, {"riva": riva_pkg, "riva.client": riva_client}):
-            out = transcribe_audio_file(
-                wav,
-                "openai/whisper-large-v3",
-                api_key="key-a,key-b",
-            )
+        out = transcribe_audio_file(
+            wav,
+            "openai/whisper-large-v3",
+            api_key="key-a,key-b",
+        )
 
     riva_client.Auth.assert_called_once()
     metadata_args = riva_client.Auth.call_args.kwargs["metadata_args"]
@@ -58,7 +61,7 @@ def test_transcribe_audio_file_picks_one_comma_separated_key(tmp_path: Path) -> 
 
 
 def test_nim_asr_model_map_entries_are_real_function_ids() -> None:
-    from providers.nvidia_nim.voice import _NIM_ASR_MODEL_MAP
+    from free_claude_code.providers.nvidia_nim.voice import _NIM_ASR_MODEL_MAP
 
     for function_id, language_code in _NIM_ASR_MODEL_MAP.values():
         assert function_id

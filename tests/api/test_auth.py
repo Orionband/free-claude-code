@@ -2,11 +2,11 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from api.app import create_app
-from api.dependencies import get_settings
-from config.settings import Settings
+from free_claude_code.api.dependencies import get_settings
+from free_claude_code.config.settings import Settings
+from tests.api.support import create_test_app
 
-app = create_app()
+app = create_test_app()
 
 
 def test_anthropic_auth_token_required_and_accepts_x_api_key():
@@ -20,10 +20,12 @@ def test_anthropic_auth_token_required_and_accepts_x_api_key():
         "messages": [{"role": "user", "content": "hello"}],
     }
 
-    with patch("api.routes.get_token_count", return_value=1):
+    with patch("free_claude_code.api.routes.get_token_count", return_value=1):
         # No header -> 401
         r = client.post("/v1/messages/count_tokens", json=payload)
         assert r.status_code == 401
+        assert r.headers["request-id"].startswith("req_")
+        assert "x-should-retry" not in r.headers
 
         # X-API-Key header -> 200
         r = client.post(
@@ -46,7 +48,7 @@ def test_anthropic_auth_token_accepts_bearer_authorization():
         "messages": [{"role": "user", "content": "hello"}],
     }
 
-    with patch("api.routes.get_token_count", return_value=2):
+    with patch("free_claude_code.api.routes.get_token_count", return_value=2):
         # Authorization Bearer -> 200
         r = client.post(
             "/v1/messages/count_tokens",
@@ -70,7 +72,7 @@ def test_anthropic_auth_token_normalizes_configured_whitespace():
         "messages": [{"role": "user", "content": "hello"}],
     }
 
-    with patch("api.routes.get_token_count", return_value=3):
+    with patch("free_claude_code.api.routes.get_token_count", return_value=3):
         r = client.post(
             "/v1/messages/count_tokens",
             json=payload,
@@ -90,6 +92,8 @@ def test_anthropic_auth_token_applies_to_models_endpoint():
 
     r = client.get("/v1/models")
     assert r.status_code == 401
+    assert r.headers["x-request-id"] == r.headers["request-id"]
+    assert "x-should-retry" not in r.headers
 
     r = client.get("/v1/models", headers={"X-API-Key": "models-token"})
     assert r.status_code == 200

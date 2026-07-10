@@ -5,22 +5,23 @@ from unittest.mock import MagicMock, patch
 
 import openai
 import pytest
-from httpx import HTTPStatusError, ReadTimeout, Request, Response
+from httpx import ConnectError, HTTPStatusError, ReadTimeout, Request, Response
 
-from config.constants import PROVIDER_ERROR_BODY_DISPLAY_CAP_BYTES
-from core.anthropic import (
+from free_claude_code.config.constants import PROVIDER_ERROR_BODY_DISPLAY_CAP_BYTES
+from free_claude_code.core.anthropic import (
     append_request_id,
     format_user_error_preview,
     get_user_facing_error_message,
 )
-from providers.error_mapping import (
+from free_claude_code.providers.error_mapping import (
     attach_provider_error_body,
+    exception_cause_types,
     extract_provider_error_detail,
     format_provider_error_message,
     map_error,
     user_visible_message_for_mapped_provider_error,
 )
-from providers.exceptions import (
+from free_claude_code.providers.exceptions import (
     APIError,
     AuthenticationError,
     InvalidRequestError,
@@ -41,6 +42,12 @@ def _make_openai_error(cls, message="test error", status_code=None):
     return cls(message, response=response, body=body)
 
 
+def _make_statusless_openai_api_error(
+    message: str, body: object | None = None
+) -> openai.APIError:
+    return openai.APIError(message, request=Request("POST", "http://test"), body=body)
+
+
 class TestMapError:
     """Tests for map_error function."""
 
@@ -54,7 +61,9 @@ class TestMapError:
     def test_rate_limit_error(self):
         """openai.RateLimitError -> RateLimitError and triggers global block."""
         exc = _make_openai_error(openai.RateLimitError, status_code=429)
-        with patch("providers.error_mapping.GlobalRateLimiter") as mock_rl:
+        with patch(
+            "free_claude_code.providers.error_mapping.GlobalRateLimiter"
+        ) as mock_rl:
             mock_instance = MagicMock()
             mock_rl.get_instance.return_value = mock_instance
             result = map_error(exc)
@@ -123,6 +132,45 @@ class TestMapError:
         )
         result = map_error(exc)
         assert isinstance(result, APIError)
+
+    def test_statusless_api_error_resource_exhausted_maps_to_overloaded(self):
+        """Status-less SDK APIError overload text maps to user-visible overload."""
+        exc = _make_statusless_openai_api_error(
+            "ResourceExhausted: limit reached while generating response",
+            {"error": {"message": "ResourceExhausted: limit reached", "code": 500}},
+        )
+
+        result = map_error(exc)
+
+        assert isinstance(result, OverloadedError)
+        assert result.status_code == 529
+
+    def test_statusless_api_error_rate_limit_body_blocks_limiter(self):
+        """Status-less SDK APIError with 429 body uses scoped reactive limiting."""
+        exc = _make_statusless_openai_api_error(
+            "stream embedded error",
+            {"error": {"message": "too many requests", "code": 429}},
+        )
+        limiter = MagicMock()
+
+        result = map_error(exc, rate_limiter=limiter)
+
+        assert isinstance(result, RateLimitError)
+        assert result.status_code == 429
+        limiter.set_blocked.assert_called_once_with(60)
+
+    def test_statusless_api_error_without_transient_marker_maps_to_generic_500(self):
+        """Unknown status-less SDK APIError stays generic instead of pretending success."""
+        exc = _make_statusless_openai_api_error(
+            "stream embedded error",
+            {"error": {"message": "unknown provider failure"}},
+        )
+
+        result = map_error(exc)
+
+        assert isinstance(result, APIError)
+        assert result.status_code == 500
+        assert result.message == "Provider API request failed."
 
     def test_unmapped_exception_passthrough(self):
         """Non-openai exceptions are returned as-is."""
@@ -249,6 +297,29 @@ def test_http_status_error_json_body_is_compact_and_visible():
     assert "Request ID: req_json" in msg
 
 
+def test_http_status_error_body_redacts_credentials_but_keeps_context():
+    response = Response(
+        status_code=400,
+        request=Request("POST", "http://test"),
+        json={
+            "error": {
+                "type": "BadRequest",
+                "message": "bad field api_key=SECRET authorization: Bearer TOKEN",
+            }
+        },
+    )
+    exc = HTTPStatusError("Bad Request", request=response.request, response=response)
+
+    detail = extract_provider_error_detail(exc)
+
+    assert detail.body_text is not None
+    assert "bad field" in detail.body_text
+    assert "api_key=<redacted>" in detail.body_text
+    assert "authorization: <redacted>" in detail.body_text
+    assert "SECRET" not in detail.body_text
+    assert "TOKEN" not in detail.body_text
+
+
 def test_empty_http_error_body_is_explicitly_reported():
     response = Response(
         status_code=500,
@@ -266,6 +337,48 @@ def test_empty_http_error_body_is_explicitly_reported():
 
     assert "Upstream provider EMPTY returned HTTP 500." in msg
     assert "(empty upstream error body)" in msg
+
+
+def test_connection_error_without_response_includes_sanitized_cause_chain():
+    request = Request("POST", "http://test")
+    exc = openai.APIConnectionError(request=request)
+    exc.__cause__ = ConnectError(
+        "connect failed authorization: Bearer SECRET token=ALSO_SECRET",
+        request=request,
+    )
+    mapped = map_error(exc)
+    detail = extract_provider_error_detail(exc)
+    msg = format_provider_error_message(
+        mapped,
+        detail,
+        provider_name="NIM",
+        read_timeout_s=30.0,
+        request_id="req_conn",
+    )
+
+    assert "Provider API request failed." in msg
+    assert "Provider exception:" in msg
+    assert "Connection error." in msg
+    assert "Caused by:" in msg
+    assert "ConnectError: connect failed authorization: <redacted>" in msg
+    assert "SECRET" not in msg
+    assert "Request ID: req_conn" in msg
+    assert exception_cause_types(exc) == ("ConnectError",)
+
+
+def test_connection_error_cause_chain_is_capped_for_display():
+    request = Request("POST", "http://test")
+    exc = openai.APIConnectionError(request=request)
+    exc.__cause__ = ConnectError(
+        "x" * (PROVIDER_ERROR_BODY_DISPLAY_CAP_BYTES + 10),
+        request=request,
+    )
+    detail = extract_provider_error_detail(exc)
+
+    assert detail.cause_chain_text is not None
+    assert f"truncated after {PROVIDER_ERROR_BODY_DISPLAY_CAP_BYTES} bytes" in (
+        detail.cause_chain_text
+    )
 
 
 def test_attached_provider_error_body_is_capped_for_display():
@@ -291,7 +404,22 @@ def test_attached_provider_error_body_is_capped_for_display():
 def test_streaming_transports_pass_scoped_rate_limiter_to_map_error():
     """Guardrail: streaming adapters must scope reactive 429 handling per provider."""
     root = Path(__file__).resolve().parents[2]
-    for name in ("anthropic_messages.py", "openai_compat.py"):
-        text = (root / "providers" / name).read_text(encoding="utf-8")
-        assert "map_error(" in text, name
-        assert "rate_limiter=self._global_rate_limiter" in text, name
+    for path in (
+        root
+        / "src"
+        / "free_claude_code"
+        / "providers"
+        / "transports"
+        / "anthropic_messages"
+        / "transport.py",
+        root
+        / "src"
+        / "free_claude_code"
+        / "providers"
+        / "transports"
+        / "openai_chat"
+        / "transport.py",
+    ):
+        text = path.read_text(encoding="utf-8")
+        assert "map_error(" in text, str(path)
+        assert "rate_limiter=self._global_rate_limiter" in text, str(path)

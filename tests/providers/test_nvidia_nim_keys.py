@@ -1,13 +1,11 @@
 """Tests for NVIDIA NIM API key parsing and fair selection."""
 
-from __future__ import annotations
-
 from collections import Counter
 from unittest.mock import patch
 
 import pytest
 
-from providers.nvidia_nim.keys import (
+from free_claude_code.providers.nvidia_nim.keys import (
     FairRoundRobin,
     parse_nvidia_nim_api_keys,
     pick_nvidia_nim_api_key,
@@ -16,7 +14,7 @@ from providers.nvidia_nim.keys import (
 
 
 @pytest.fixture(autouse=True)
-def _reset_key_cycles() -> None:
+def _reset_key_cycles():
     reset_nvidia_nim_api_key_cycles()
     yield
     reset_nvidia_nim_api_key_cycles()
@@ -42,7 +40,7 @@ def test_pick_nvidia_nim_api_key_returns_sole_key() -> None:
 def test_fair_round_robin_uses_each_item_once_per_round() -> None:
     cycle = FairRoundRobin(("a", "b", "c"))
     with patch(
-        "providers.nvidia_nim.keys.random.randrange",
+        "free_claude_code.providers.nvidia_nim.keys.random.randrange",
         side_effect=[1, 1, 0, 0, 0, 0],
     ):
         # remaining [a,b,c] -> pop index 1 -> b; [a,c] -> pop 1 -> c; [a] -> a
@@ -64,7 +62,7 @@ def test_fair_round_robin_rejects_empty() -> None:
 def test_pick_nvidia_nim_api_key_cycles_without_reuse_until_exhausted() -> None:
     keys = "key-a,key-b,key-c"
     with patch(
-        "providers.nvidia_nim.keys.random.randrange",
+        "free_claude_code.providers.nvidia_nim.keys.random.randrange",
         side_effect=[1, 0, 0, 2, 0, 0],
     ):
         # round 1: [a,b,c]->b; [a,c]->a; [c]->c
@@ -88,7 +86,7 @@ def test_pick_nvidia_nim_api_key_cycles_without_reuse_until_exhausted() -> None:
 
 def test_pick_nvidia_nim_api_key_reuses_cycle_for_same_key_set() -> None:
     with patch(
-        "providers.nvidia_nim.keys.random.randrange",
+        "free_claude_code.providers.nvidia_nim.keys.random.randrange",
         side_effect=[0, 0],
     ):
         assert pick_nvidia_nim_api_key("a,b") == "a"

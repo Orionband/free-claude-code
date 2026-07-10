@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import math
 import os
 import wave
@@ -7,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from messaging.transcription import transcribe_audio
+from free_claude_code.messaging.transcription import transcribe_audio
 from smoke.lib.config import SmokeConfig
 
 pytestmark = [pytest.mark.live, pytest.mark.smoke_target("voice")]

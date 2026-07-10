@@ -1,0 +1,148 @@
+"""Pure FastAPI application factory."""
+
+import traceback
+from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from loguru import logger
+
+from free_claude_code.core.anthropic import (
+    anthropic_error_payload,
+    get_user_facing_error_message,
+)
+from free_claude_code.core.trace import (
+    extract_claude_session_id_from_headers,
+    trace_event,
+)
+from free_claude_code.providers.exceptions import ProviderError
+
+from .admin_routes import router as admin_router
+from .ports import ApiServices
+from .request_ids import (
+    attach_request_id_headers,
+    get_request_id,
+    new_request_id,
+    set_request_id,
+)
+from .routes import router
+from .validation_log import summarize_request_validation_body
+
+
+def create_app(services: ApiServices) -> FastAPI:
+    """Create the HTTP adapter around explicitly supplied runtime services."""
+    app = FastAPI(title="Claude Code Proxy", version="2.1.0")
+    app.state.services = services
+
+    @app.middleware("http")
+    async def trace_http_correlation(request: Request, call_next):
+        """Attach HTTP identifiers and optional Claude session id to logs."""
+        request_id = new_request_id()
+        set_request_id(request, request_id)
+        claude_sid = extract_claude_session_id_from_headers(request.headers)
+        with logger.contextualize(
+            http_method=request.method,
+            http_path=request.url.path,
+            claude_session_id=claude_sid,
+            request_id=request_id,
+        ):
+            response = await call_next(request)
+            attach_request_id_headers(
+                response,
+                request_id=request_id,
+                path=request.url.path,
+            )
+        return response
+
+    app.include_router(admin_router)
+    app.include_router(router)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_error_handler(request: Request, exc: RequestValidationError):
+        """Log request shape for 422 debugging without content values."""
+        body: Any
+        try:
+            body = await request.json()
+        except Exception as error:
+            body = {"_json_error": type(error).__name__}
+
+        message_summary, tool_names = summarize_request_validation_body(body)
+        trace_event(
+            stage="ingress",
+            event="server.request.validation_failed",
+            source="api",
+            path=request.url.path,
+            query=dict(request.query_params),
+            error_locs=[list(error.get("loc", ())) for error in exc.errors()],
+            error_types=[str(error.get("type", "")) for error in exc.errors()],
+            message_summary=message_summary,
+            tool_names=tool_names,
+        )
+        return await request_validation_exception_handler(request, exc)
+
+    @app.exception_handler(ProviderError)
+    async def provider_error_handler(request: Request, exc: ProviderError):
+        """Handle provider-specific errors and return Anthropic format."""
+        settings = services.requests.current_settings()
+        if settings.log_api_error_tracebacks:
+            logger.error(
+                "Provider Error: error_type={} status_code={} message={}",
+                exc.error_type,
+                exc.status_code,
+                exc.message,
+            )
+        else:
+            logger.error(
+                "Provider Error: error_type={} status_code={}",
+                exc.error_type,
+                exc.status_code,
+            )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=anthropic_error_payload(
+                error_type=exc.error_type,
+                message=exc.message,
+                request_id=get_request_id(request),
+            ),
+        )
+
+    @app.exception_handler(Exception)
+    async def general_error_handler(request: Request, exc: Exception):
+        """Handle general errors and return Anthropic format."""
+        request_id = get_request_id(request)
+        claude_sid = extract_claude_session_id_from_headers(request.headers)
+        settings = services.requests.current_settings()
+        with logger.contextualize(
+            http_method=request.method,
+            http_path=request.url.path,
+            claude_session_id=claude_sid,
+            request_id=request_id,
+        ):
+            if settings.log_api_error_tracebacks:
+                logger.error("General Error: {}", exc)
+                logger.error(traceback.format_exc())
+            else:
+                logger.error(
+                    "General Error: path={} method={} exc_type={}",
+                    request.url.path,
+                    request.method,
+                    type(exc).__name__,
+                )
+            response = JSONResponse(
+                status_code=500,
+                content=anthropic_error_payload(
+                    error_type="api_error",
+                    message=get_user_facing_error_message(exc),
+                    request_id=request_id,
+                ),
+            )
+        attach_request_id_headers(
+            response,
+            request_id=request_id,
+            path=request.url.path,
+        )
+        return response
+
+    return app
