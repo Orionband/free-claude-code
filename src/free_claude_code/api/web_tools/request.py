@@ -1,6 +1,33 @@
-"""Detect forced Anthropic web server tool requests."""
+"""Detect and prepare Anthropic web server tool requests."""
 
 from free_claude_code.api.models.anthropic import MessagesRequest, Tool
+
+_WEB_SEARCH_INPUT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": "The search query to look up on the web.",
+        }
+    },
+    "required": ["query"],
+}
+
+_WEB_FETCH_INPUT_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {
+        "url": {
+            "type": "string",
+            "description": "The URL to fetch and read.",
+        }
+    },
+    "required": ["url"],
+}
+
+_WEB_SEARCH_DESCRIPTION = "Search the web for current information. Returns titles and URLs for matching pages."
+_WEB_FETCH_DESCRIPTION = (
+    "Fetch a URL and return readable page text for the model to use."
+)
 
 
 def request_text(request: MessagesRequest) -> str:
@@ -59,6 +86,11 @@ def is_anthropic_server_tool_definition(tool: Tool) -> bool:
     return False
 
 
+def is_local_web_tool_name(name: str | None) -> bool:
+    """True when ``name`` is a locally executable Anthropic web server tool."""
+    return (name or "").strip() in {"web_search", "web_fetch"}
+
+
 def openai_chat_upstream_server_tool_error(
     request: MessagesRequest, *, web_tools_enabled: bool
 ) -> str | None:
@@ -73,19 +105,68 @@ def openai_chat_upstream_server_tool_error(
     return None
 
 
-def strip_listed_anthropic_server_tools(request: MessagesRequest) -> MessagesRequest:
-    """Drop listed web_search / web_fetch tool defs that OpenAI Chat upstreams cannot honor.
+def _synthetic_web_tool(tool: Tool) -> Tool | None:
+    name = (tool.name or "").strip()
+    typ = tool.type if isinstance(tool.type, str) else ""
+    if name == "web_search" or typ.startswith("web_search"):
+        return Tool(
+            name="web_search",
+            type="custom",
+            description=tool.description or _WEB_SEARCH_DESCRIPTION,
+            input_schema=_WEB_SEARCH_INPUT_SCHEMA,
+        )
+    if name == "web_fetch" or typ.startswith("web_fetch"):
+        return Tool(
+            name="web_fetch",
+            type="custom",
+            description=tool.description or _WEB_FETCH_DESCRIPTION,
+            input_schema=_WEB_FETCH_INPUT_SCHEMA,
+        )
+    return None
 
-    Forced ``tool_choice`` server-tool turns are left intact so the local handler can run.
-    Merely listing these Anthropic server tools (Claude Code's default) must not 400 the
-    whole request on NIM and other OpenAI-chat providers.
+
+def prepare_openai_chat_server_tools(
+    request: MessagesRequest, *, web_tools_enabled: bool
+) -> MessagesRequest:
+    """Prepare listed Anthropic server tools for OpenAI-chat upstreams.
+
+    When local web tools are enabled, rewrite ``web_search`` / ``web_fetch`` into callable
+    function tools with real JSON schemas so NIM (and peers) can invoke them. FCC then
+    executes those calls locally and returns Anthropic ``server_tool_use`` SSE.
+
+    When disabled, strip listed server tools so the request does not 400. Forced
+    ``tool_choice`` turns are left intact for the dedicated intercept / error path.
     """
     if forced_server_tool_name(request) is not None:
         return request
     tools = request.tools
     if not tools:
         return request
-    kept = [tool for tool in tools if not is_anthropic_server_tool_definition(tool)]
-    if len(kept) == len(tools):
+
+    if not web_tools_enabled:
+        kept = [tool for tool in tools if not is_anthropic_server_tool_definition(tool)]
+        if len(kept) == len(tools):
+            return request
+        return request.model_copy(update={"tools": kept or None})
+
+    rewritten: list[Tool] = []
+    changed = False
+    for tool in tools:
+        if not is_anthropic_server_tool_definition(tool):
+            rewritten.append(tool)
+            continue
+        synthetic = _synthetic_web_tool(tool)
+        if synthetic is None:
+            changed = True
+            continue
+        if (
+            tool.type != synthetic.type
+            or tool.input_schema != synthetic.input_schema
+            or (tool.description or "") != (synthetic.description or "")
+        ):
+            changed = True
+        rewritten.append(synthetic)
+
+    if not changed:
         return request
-    return request.model_copy(update={"tools": kept or None})
+    return request.model_copy(update={"tools": rewritten or None})

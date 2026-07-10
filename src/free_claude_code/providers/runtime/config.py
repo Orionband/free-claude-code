@@ -68,4 +68,7 @@ def build_provider_config(
         proxy=proxy,
         log_raw_sse_events=settings.log_raw_sse_events,
         log_api_error_tracebacks=settings.log_api_error_tracebacks,
+        enable_web_server_tools=settings.enable_web_server_tools,
+        web_fetch_allow_private_networks=settings.web_fetch_allow_private_networks,
+        web_fetch_allowed_schemes=settings.web_fetch_allowed_schemes,
     )

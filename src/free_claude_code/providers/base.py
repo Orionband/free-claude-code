@@ -32,6 +32,9 @@ class ProviderConfig(BaseModel):
     proxy: str = ""
     log_raw_sse_events: bool = False
     log_api_error_tracebacks: bool = False
+    enable_web_server_tools: bool = False
+    web_fetch_allow_private_networks: bool = False
+    web_fetch_allowed_schemes: str = "http,https"
 
 
 class BaseProvider(ABC):

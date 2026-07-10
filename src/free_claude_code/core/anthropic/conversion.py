@@ -151,6 +151,89 @@ def _assert_no_forbidden_assistant_block(block: Any) -> None:
         )
 
 
+def _server_tool_result_summary(block: Any) -> str:
+    """Build a short plain-text summary from a web_*_tool_result block."""
+    content = get_block_attr(block, "content")
+    block_type = get_block_type(block)
+    if block_type == "web_search_tool_result" and isinstance(content, list):
+        lines: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "web_search_result":
+                continue
+            title = str(item.get("title") or "").strip()
+            url = str(item.get("url") or "").strip()
+            if title and url:
+                lines.append(f"- {title}: {url}")
+            elif url:
+                lines.append(f"- {url}")
+        if lines:
+            return "Web search results:\n" + "\n".join(lines)
+    if block_type == "web_fetch_tool_result" and isinstance(content, dict):
+        url = str(content.get("url") or "").strip()
+        doc = content.get("content")
+        text = ""
+        if isinstance(doc, dict):
+            source = doc.get("source")
+            if isinstance(source, dict) and isinstance(source.get("data"), str):
+                text = source["data"].strip()
+            title = str(doc.get("title") or "").strip()
+        else:
+            title = ""
+        parts = ["Web fetch result"]
+        if title:
+            parts.append(f"title={title}")
+        if url:
+            parts.append(f"url={url}")
+        header = " ".join(parts)
+        if text:
+            return f"{header}\n{text[:4000]}"
+        return header
+    return ""
+
+
+def normalize_assistant_server_tool_blocks(content: list[Any]) -> list[Any]:
+    """Collapse Anthropic server-tool blocks into plain text for OpenAI-chat replay.
+
+    Local web-tool turns emit ``server_tool_use`` / ``web_*_tool_result`` / ``text``.
+    OpenAI-chat conversion cannot replay those block types, so fold them into text.
+    """
+    normalized: list[Any] = []
+    pending_summaries: list[str] = []
+    for block in content:
+        block_type = get_block_type(block)
+        if block_type == "server_tool_use":
+            name = str(get_block_attr(block, "name") or "").strip() or "web_tool"
+            tool_input = get_block_attr(block, "input")
+            if isinstance(tool_input, dict) and tool_input:
+                pending_summaries.append(f"Used {name} with {tool_input}")
+            else:
+                pending_summaries.append(f"Used {name}")
+            continue
+        if block_type in {"web_search_tool_result", "web_fetch_tool_result"}:
+            summary = _server_tool_result_summary(block)
+            if summary:
+                pending_summaries.append(summary)
+            continue
+        if block_type == "text":
+            text = str(get_block_attr(block, "text") or "")
+            if pending_summaries:
+                prefix = "\n\n".join(pending_summaries)
+                pending_summaries.clear()
+                text = f"{prefix}\n\n{text}" if text else prefix
+            if text:
+                normalized.append({"type": "text", "text": text})
+            continue
+        if pending_summaries:
+            normalized.append({"type": "text", "text": "\n\n".join(pending_summaries)})
+            pending_summaries.clear()
+        normalized.append(block)
+    if pending_summaries:
+        normalized.append({"type": "text", "text": "\n\n".join(pending_summaries)})
+    return normalized
+
+
 class _OpenAIChatHistoryLedger:
     """Assemble OpenAI chat history while respecting tool-result dependencies."""
 
@@ -325,6 +408,7 @@ class AnthropicToOpenAIConverter:
         reasoning_replay: ReasoningReplayMode,
     ) -> list[_TranscriptSegment]:
         if role == "assistant" and isinstance(content, list):
+            content = normalize_assistant_server_tool_blocks(content)
             if (first_i := _index_first_tool_use(content)) is not None:
                 for block in content:
                     if get_block_type(block) == "tool_use":

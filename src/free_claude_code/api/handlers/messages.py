@@ -34,7 +34,7 @@ from free_claude_code.api.web_tools.egress import (
 from free_claude_code.api.web_tools.request import (
     is_web_server_tool_request,
     openai_chat_upstream_server_tool_error,
-    strip_listed_anthropic_server_tools,
+    prepare_openai_chat_server_tools,
 )
 from free_claude_code.api.web_tools.streaming import stream_web_server_tool_response
 from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
@@ -288,17 +288,21 @@ class MessagesHandler:
         )
         if tool_err is not None:
             raise InvalidRequestError(tool_err)
-        stripped = strip_listed_anthropic_server_tools(routed.request)
-        if stripped is routed.request:
+        prepared = prepare_openai_chat_server_tools(
+            routed.request,
+            web_tools_enabled=self._settings.enable_web_server_tools,
+        )
+        if prepared is routed.request:
             return routed
         trace_event(
             stage="routing",
-            event="free_claude_code.api.optimization.strip_openai_chat_server_tools",
+            event="free_claude_code.api.optimization.prepare_openai_chat_server_tools",
             source="api",
             model=routed.request.model,
             provider=routed.resolved.provider_id,
+            web_tools_enabled=self._settings.enable_web_server_tools,
         )
-        return RoutedMessagesRequest(request=stripped, resolved=routed.resolved)
+        return RoutedMessagesRequest(request=prepared, resolved=routed.resolved)
 
     def _apply_message_routing_policies(
         self, routed: RoutedMessagesRequest

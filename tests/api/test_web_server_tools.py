@@ -27,7 +27,7 @@ from free_claude_code.api.web_tools.outbound import (
 )
 from free_claude_code.api.web_tools.request import (
     is_web_server_tool_request,
-    strip_listed_anthropic_server_tools,
+    prepare_openai_chat_server_tools,
 )
 from free_claude_code.api.web_tools.streaming import stream_web_server_tool_response
 from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
@@ -90,7 +90,7 @@ def test_web_server_tool_not_detected_when_tool_only_listed():
     assert not is_web_server_tool_request(request)
 
 
-def test_strip_listed_anthropic_server_tools_keeps_client_tools():
+def test_prepare_openai_chat_server_tools_strips_when_disabled():
     request = MessagesRequest(
         model="claude-haiku-4-5-20251001",
         max_tokens=100,
@@ -101,11 +101,29 @@ def test_strip_listed_anthropic_server_tools_keeps_client_tools():
             Tool(name="Bash", type="custom", input_schema={"type": "object"}),
         ],
     )
-    stripped = strip_listed_anthropic_server_tools(request)
-    assert [tool.name for tool in (stripped.tools or [])] == ["Bash"]
+    prepared = prepare_openai_chat_server_tools(request, web_tools_enabled=False)
+    assert [tool.name for tool in (prepared.tools or [])] == ["Bash"]
 
 
-def test_strip_listed_anthropic_server_tools_preserves_forced_turn():
+def test_prepare_openai_chat_server_tools_rewrites_schemas_when_enabled():
+    request = MessagesRequest(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=100,
+        messages=[Message(role="user", content="search")],
+        tools=[
+            Tool(name="web_search", type="web_search_20250305"),
+            Tool(name="Bash", type="custom", input_schema={"type": "object"}),
+        ],
+    )
+    prepared = prepare_openai_chat_server_tools(request, web_tools_enabled=True)
+    tools = {tool.name: tool for tool in (prepared.tools or [])}
+    assert set(tools) == {"web_search", "Bash"}
+    assert tools["web_search"].type == "custom"
+    assert tools["web_search"].input_schema is not None
+    assert "query" in tools["web_search"].input_schema["properties"]
+
+
+def test_prepare_openai_chat_server_tools_preserves_forced_turn():
     request = MessagesRequest(
         model="claude-haiku-4-5-20251001",
         max_tokens=100,
@@ -113,7 +131,7 @@ def test_strip_listed_anthropic_server_tools_preserves_forced_turn():
         tools=[Tool(name="web_search", type="web_search_20250305")],
         tool_choice={"type": "tool", "name": "web_search"},
     )
-    assert strip_listed_anthropic_server_tools(request) is request
+    assert prepare_openai_chat_server_tools(request, web_tools_enabled=True) is request
 
 
 def test_web_server_tool_detected_when_tool_choice_forces_it():
@@ -782,13 +800,10 @@ async def test_drain_response_body_capped_stops_after_first_chunk_when_oversized
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider_id", _OPENAI_CHAT_PROVIDER_IDS)
-@pytest.mark.parametrize("web_tools_enabled", [False, True])
-async def test_service_strips_listed_server_tools_on_openai_chat(
+async def test_service_strips_listed_server_tools_on_openai_chat_when_disabled(
     provider_id: str,
-    web_tools_enabled: bool,
 ) -> None:
-    """Claude Code lists web_search; OpenAI-chat (e.g. NIM) should strip, not 400."""
-    settings = Settings.model_validate({"ENABLE_WEB_SERVER_TOOLS": web_tools_enabled})
+    settings = Settings.model_validate({"ENABLE_WEB_SERVER_TOOLS": False})
 
     async def fake_stream(request, *_a, **_k):
         names = [tool.name for tool in (request.tools or [])]
@@ -824,6 +839,38 @@ async def test_service_strips_listed_server_tools_on_openai_chat(
     preflight_names = [tool.name for tool in (preflight_request.tools or [])]
     assert "web_search" not in preflight_names
     assert "Bash" in preflight_names
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_id", ["nvidia_nim"])
+async def test_service_keeps_synthetic_web_search_on_openai_chat_when_enabled(
+    provider_id: str,
+) -> None:
+    settings = Settings.model_validate({"ENABLE_WEB_SERVER_TOOLS": True})
+
+    async def fake_stream(request, *_a, **_k):
+        tools = {tool.name: tool for tool in (request.tools or [])}
+        assert "web_search" in tools
+        assert tools["web_search"].input_schema is not None
+        assert "query" in tools["web_search"].input_schema["properties"]
+        yield 'event: message_start\ndata: {"type":"message_start"}\n\n'
+        yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+    mock_provider = MagicMock()
+    mock_provider.stream_response = fake_stream
+    service = MessagesHandler(
+        settings,
+        provider_getter=lambda _: mock_provider,
+        model_router=FixedProviderModelRouter(settings, provider_id),
+    )
+    request = MessagesRequest(
+        model="m",
+        max_tokens=20,
+        messages=[Message(role="user", content="q")],
+        tools=[Tool(name="web_search", type="web_search_20250305")],
+    )
+    await service.create(request)
+    mock_provider.preflight_stream.assert_called()
 
 
 @pytest.mark.asyncio
@@ -883,3 +930,71 @@ async def test_forced_server_tools_routed_on_anthropic_messages_providers_when_l
     )
     await service.create(request)
     mock_provider.preflight_stream.assert_called()
+
+
+def test_local_web_tool_call_buffer_accumulates_web_search():
+    from free_claude_code.providers.transports.openai_chat.local_web_tools import (
+        LocalWebToolCallBuffer,
+    )
+
+    buf = LocalWebToolCallBuffer()
+    assert buf.observe(
+        {
+            "index": 0,
+            "id": "call_abc",
+            "function": {"name": "web_search", "arguments": ""},
+        }
+    )
+    assert buf.observe(
+        {
+            "index": 0,
+            "function": {"arguments": '{"query":"DeepSeek V4"}'},
+        }
+    )
+    assert not buf.observe(
+        {
+            "index": 1,
+            "id": "call_bash",
+            "function": {"name": "Bash", "arguments": "{}"},
+        }
+    )
+    calls = buf.completed_calls()
+    assert calls == [("web_search", "call_abc", {"query": "DeepSeek V4"})]
+
+
+@pytest.mark.asyncio
+async def test_iter_local_web_tool_sse_without_envelope(monkeypatch):
+    async def fake_search(query: str) -> list[dict[str, str]]:
+        assert query == "DeepSeek"
+        return [{"title": "DeepSeek", "url": "https://example.com/ds"}]
+
+    monkeypatch.setattr(
+        "free_claude_code.api.web_tools.outbound._run_web_search", fake_search
+    )
+    from free_claude_code.api.web_tools.streaming import iter_local_web_tool_sse
+
+    raw = "".join(
+        [
+            event
+            async for event in iter_local_web_tool_sse(
+                tool_name="web_search",
+                tool_input={"query": "DeepSeek"},
+                model="m",
+                input_tokens=10,
+                web_fetch_egress=_STRICT_EGRESS,
+                message_id="msg_test",
+                starting_block_index=2,
+                include_message_envelope=False,
+                tool_id="srvtoolu_test",
+            )
+        ]
+    )
+    events = parse_sse_text(raw)
+    assert not any(e.event == "message_start" for e in events)
+    assert not any(e.event == "message_stop" for e in events)
+    starts = [e for e in events if e.event == "content_block_start"]
+    assert starts[0].data["index"] == 2
+    assert starts[0].data["content_block"]["type"] == "server_tool_use"
+    assert starts[0].data["content_block"]["id"] == "srvtoolu_test"
+    assert starts[1].data["content_block"]["type"] == "web_search_tool_result"
+    assert "example.com" in text_content(events)

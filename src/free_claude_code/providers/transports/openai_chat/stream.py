@@ -23,6 +23,7 @@ from free_claude_code.core.trace import provider_chat_body_snapshot, trace_event
 from free_claude_code.providers.error_mapping import map_stream_start_error
 from free_claude_code.providers.transports.http import maybe_await_aclose
 
+from .local_web_tools import LocalWebToolCallBuffer
 from .recovery import OpenAIChatRecovery
 from .tool_calls import (
     OpenAIToolCallAssembler,
@@ -58,6 +59,10 @@ class OpenAIChatStreamAdapter:
         self._recovery = OpenAIChatRecovery(
             provider_name=transport._provider_name,
             create_stream=transport._create_stream,
+        )
+        self._local_web_tools = LocalWebToolCallBuffer()
+        self._web_tools_enabled = bool(
+            getattr(transport._config, "enable_web_server_tools", False)
         )
 
     async def run(self) -> AsyncIterator[str]:
@@ -201,6 +206,11 @@ class OpenAIChatStreamAdapter:
                                 }
                                 if extra_content:
                                     tc_info["extra_content"] = extra_content
+                                if (
+                                    self._web_tools_enabled
+                                    and self._local_web_tools.observe(tc_info)
+                                ):
+                                    continue
                                 for event in self._tool_calls.process_tool_call(
                                     tc_info,
                                     ledger,
@@ -239,6 +249,7 @@ class OpenAIChatStreamAdapter:
                         usage_info = None
                         tool_argument_aliases = {}
                         tool_argument_alias_buffers = {}
+                        self._local_web_tools = LocalWebToolCallBuffer()
                         continue
 
                     if decision.action == RecoveryFailureAction.MIDSTREAM_RECOVERY:
@@ -348,13 +359,16 @@ class OpenAIChatStreamAdapter:
                     yield out_event
 
         has_emitted_tool = ledger.has_emitted_tool_block()
+        has_local_web = self._web_tools_enabled and self._local_web_tools.has_calls
         has_content_blocks = (
             ledger.blocks.text_index != -1
             or ledger.blocks.thinking_index != -1
             or has_emitted_tool
+            or has_local_web
         )
         if not has_content_blocks or (
             not has_emitted_tool
+            and not has_local_web
             and not ledger.accumulated_text.strip()
             and ledger.accumulated_reasoning.strip()
         ):
@@ -375,6 +389,52 @@ class OpenAIChatStreamAdapter:
 
         for event in hold_events(ledger.close_all_blocks()):
             yield event
+
+        local_web_calls = (
+            self._local_web_tools.completed_calls() if self._web_tools_enabled else []
+        )
+        server_tool_usage: dict[str, int] = {}
+        if local_web_calls:
+            from free_claude_code.api.web_tools.egress import (
+                WebFetchEgressPolicy,
+                web_fetch_allowed_scheme_set,
+            )
+            from free_claude_code.api.web_tools.streaming import iter_local_web_tool_sse
+
+            config = self._transport._config
+            egress = WebFetchEgressPolicy(
+                allow_private_network_targets=config.web_fetch_allow_private_networks,
+                allowed_schemes=web_fetch_allowed_scheme_set(
+                    config.web_fetch_allowed_schemes
+                ),
+            )
+            block_index = ledger.blocks.next_index
+            for tool_name, tool_id, tool_input in local_web_calls:
+                usage_key = (
+                    "web_search_requests"
+                    if tool_name == "web_search"
+                    else "web_fetch_requests"
+                )
+                server_tool_usage[usage_key] = server_tool_usage.get(usage_key, 0) + 1
+                async for event in iter_local_web_tool_sse(
+                    tool_name=tool_name,
+                    tool_input=tool_input,
+                    model=self._request.model,
+                    input_tokens=self._input_tokens,
+                    web_fetch_egress=egress,
+                    verbose_client_errors=config.log_api_error_tracebacks,
+                    message_id=self._message_id,
+                    starting_block_index=block_index,
+                    include_message_envelope=False,
+                    tool_id=tool_id,
+                ):
+                    for out_event in hold_event(event):
+                        yield out_event
+                # server_tool_use + result + text = 3 blocks
+                block_index += 3
+            # Prefer end_turn when local web tools were the only tool calls.
+            if not ledger.has_emitted_tool_block():
+                finish_reason = "stop"
 
         completion = usage_int(usage_info, "completion_tokens")
         if isinstance(completion, int):
@@ -403,12 +463,17 @@ class OpenAIChatStreamAdapter:
             prompt_tokens=input_tokens,
             prompt_tokens_estimate=self._input_tokens,
         )
+        usage_fields = dict(self._transport._anthropic_usage_fields(usage_info))
+        if server_tool_usage:
+            usage_fields["server_tool_use"] = {
+                key: count for key, count in server_tool_usage.items() if count
+            }
         for event in hold_event(
             ledger.message_delta(
                 ledger.final_stop_reason(map_stop_reason(finish_reason)),
                 output_tokens,
                 input_tokens=input_tokens,
-                usage_fields=self._transport._anthropic_usage_fields(usage_info),
+                usage_fields=usage_fields,
             )
         ):
             yield event

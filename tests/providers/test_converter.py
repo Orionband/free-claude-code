@@ -1026,21 +1026,75 @@ def test_openai_build_rejects_unknown_top_level_extras() -> None:
         build_base_request_body(req)
 
 
-@pytest.mark.parametrize(
-    "content",
-    [
-        [MockBlock(type="server_tool_use", id="1", name="web_search", input={})],
-        [MockBlock(type="web_search_tool_result", tool_use_id="1", content=[])],
-        [
-            MockBlock(
-                type="web_fetch_tool_result",
-                tool_use_id="1",
-                content={"type": "web_fetch_result", "url": "https://a.com/x"},
-            )
-        ],
-    ],
-)
-def test_convert_assistant_server_tool_blocks_raise(content) -> None:
-    messages = [MockMessage("assistant", content)]
-    with pytest.raises(OpenAIConversionError, match="server tool"):
-        AnthropicToOpenAIConverter.convert_messages(messages)
+def test_convert_assistant_server_tool_blocks_normalize_to_text() -> None:
+    """Local web-tool history must replay as plain text on OpenAI-chat upstreams."""
+    messages = [
+        MockMessage(
+            "assistant",
+            [
+                MockBlock(
+                    type="server_tool_use",
+                    id="1",
+                    name="web_search",
+                    input={"query": "DeepSeek V4"},
+                ),
+                MockBlock(
+                    type="web_search_tool_result",
+                    tool_use_id="1",
+                    content=[
+                        {
+                            "type": "web_search_result",
+                            "title": "DeepSeek",
+                            "url": "https://example.com/deepseek",
+                        }
+                    ],
+                ),
+                MockBlock(type="text", text="Here is what I found."),
+            ],
+        )
+    ]
+    result = AnthropicToOpenAIConverter.convert_messages(messages)
+    assert len(result) == 1
+    assert result[0]["role"] == "assistant"
+    content = result[0]["content"]
+    assert "Used web_search" in content
+    assert "DeepSeek V4" in content
+    assert "https://example.com/deepseek" in content
+    assert "Here is what I found." in content
+
+
+def test_convert_assistant_server_tool_blocks_alone_become_text() -> None:
+    messages = [
+        MockMessage(
+            "assistant",
+            [
+                MockBlock(
+                    type="server_tool_use",
+                    id="1",
+                    name="web_fetch",
+                    input={"url": "https://example.com"},
+                ),
+                MockBlock(
+                    type="web_fetch_tool_result",
+                    tool_use_id="1",
+                    content={
+                        "type": "web_fetch_result",
+                        "url": "https://example.com",
+                        "content": {
+                            "type": "document",
+                            "title": "Example",
+                            "source": {
+                                "type": "text",
+                                "media_type": "text/plain",
+                                "data": "Hello from the page",
+                            },
+                        },
+                    },
+                ),
+            ],
+        )
+    ]
+    result = AnthropicToOpenAIConverter.convert_messages(messages)
+    assert result[0]["role"] == "assistant"
+    assert "Used web_fetch" in result[0]["content"]
+    assert "Hello from the page" in result[0]["content"]
