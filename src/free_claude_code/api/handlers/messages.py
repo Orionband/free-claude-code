@@ -34,6 +34,7 @@ from free_claude_code.api.web_tools.egress import (
 from free_claude_code.api.web_tools.request import (
     is_web_server_tool_request,
     openai_chat_upstream_server_tool_error,
+    strip_listed_anthropic_server_tools,
 )
 from free_claude_code.api.web_tools.streaming import stream_web_server_tool_response
 from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
@@ -107,7 +108,7 @@ class MessagesHandler:
             require_non_empty_messages(request_data.messages)
             routed = self._model_router.resolve_messages_request(request_data)
             routed = self._apply_message_routing_policies(routed)
-            self._reject_unsupported_server_tools(routed)
+            routed = self._sanitize_openai_chat_server_tools(routed)
 
             result = self._run_message_intercepts(routed)
             if result is None:
@@ -276,15 +277,28 @@ class MessagesHandler:
             fields["exc_type"] = exc_type
         trace_event(**fields)
 
-    def _reject_unsupported_server_tools(self, routed: RoutedMessagesRequest) -> None:
+    def _sanitize_openai_chat_server_tools(
+        self, routed: RoutedMessagesRequest
+    ) -> RoutedMessagesRequest:
         if routed.resolved.provider_id not in _OPENAI_CHAT_UPSTREAM_IDS:
-            return
+            return routed
         tool_err = openai_chat_upstream_server_tool_error(
             routed.request,
             web_tools_enabled=self._settings.enable_web_server_tools,
         )
         if tool_err is not None:
             raise InvalidRequestError(tool_err)
+        stripped = strip_listed_anthropic_server_tools(routed.request)
+        if stripped is routed.request:
+            return routed
+        trace_event(
+            stage="routing",
+            event="free_claude_code.api.optimization.strip_openai_chat_server_tools",
+            source="api",
+            model=routed.request.model,
+            provider=routed.resolved.provider_id,
+        )
+        return RoutedMessagesRequest(request=stripped, resolved=routed.resolved)
 
     def _apply_message_routing_policies(
         self, routed: RoutedMessagesRequest

@@ -59,15 +59,10 @@ def is_anthropic_server_tool_definition(tool: Tool) -> bool:
     return False
 
 
-def has_listed_anthropic_server_tools(request: MessagesRequest) -> bool:
-    """True when tools include web_search / web_fetch-style entries (listed, forced or not)."""
-    return any(is_anthropic_server_tool_definition(t) for t in (request.tools or []))
-
-
 def openai_chat_upstream_server_tool_error(
     request: MessagesRequest, *, web_tools_enabled: bool
 ) -> str | None:
-    """Return a user-facing error when OpenAI Chat upstream cannot satisfy server-tool semantics."""
+    """Return a user-facing error when a forced server tool cannot be handled locally."""
     forced = forced_server_tool_name(request)
     if forced and not web_tools_enabled:
         return (
@@ -75,11 +70,22 @@ def openai_chat_upstream_server_tool_error(
             "disabled (ENABLE_WEB_SERVER_TOOLS=false). Enable them or use a native Anthropic "
             "Messages transport such as ollama or llama.cpp."
         )
-    if not forced and has_listed_anthropic_server_tools(request):
-        return (
-            "OpenAI Chat upstreams cannot use listed Anthropic server tools "
-            "(web_search / web_fetch) without the local web server tool handler. Use a native "
-            "Anthropic transport such as ollama or llama.cpp, set ENABLE_WEB_SERVER_TOOLS=true and force the tool with "
-            "tool_choice, or remove these tools from the request."
-        )
     return None
+
+
+def strip_listed_anthropic_server_tools(request: MessagesRequest) -> MessagesRequest:
+    """Drop listed web_search / web_fetch tool defs that OpenAI Chat upstreams cannot honor.
+
+    Forced ``tool_choice`` server-tool turns are left intact so the local handler can run.
+    Merely listing these Anthropic server tools (Claude Code's default) must not 400 the
+    whole request on NIM and other OpenAI-chat providers.
+    """
+    if forced_server_tool_name(request) is not None:
+        return request
+    tools = request.tools
+    if not tools:
+        return request
+    kept = [tool for tool in tools if not is_anthropic_server_tool_definition(tool)]
+    if len(kept) == len(tools):
+        return request
+    return request.model_copy(update={"tools": kept or None})

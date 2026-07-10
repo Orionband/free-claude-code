@@ -25,7 +25,10 @@ from free_claude_code.api.web_tools.outbound import (
     _read_response_body_capped,
     _run_web_fetch,
 )
-from free_claude_code.api.web_tools.request import is_web_server_tool_request
+from free_claude_code.api.web_tools.request import (
+    is_web_server_tool_request,
+    strip_listed_anthropic_server_tools,
+)
 from free_claude_code.api.web_tools.streaming import stream_web_server_tool_response
 from free_claude_code.config.provider_catalog import PROVIDER_CATALOG
 from free_claude_code.config.settings import Settings
@@ -85,6 +88,32 @@ def test_web_server_tool_not_detected_when_tool_only_listed():
     )
 
     assert not is_web_server_tool_request(request)
+
+
+def test_strip_listed_anthropic_server_tools_keeps_client_tools():
+    request = MessagesRequest(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=100,
+        messages=[Message(role="user", content="search")],
+        tools=[
+            Tool(name="web_search", type="web_search_20250305"),
+            Tool(name="web_fetch", type="web_fetch_20250305"),
+            Tool(name="Bash", type="custom", input_schema={"type": "object"}),
+        ],
+    )
+    stripped = strip_listed_anthropic_server_tools(request)
+    assert [tool.name for tool in (stripped.tools or [])] == ["Bash"]
+
+
+def test_strip_listed_anthropic_server_tools_preserves_forced_turn():
+    request = MessagesRequest(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=100,
+        messages=[Message(role="user", content="search")],
+        tools=[Tool(name="web_search", type="web_search_20250305")],
+        tool_choice={"type": "tool", "name": "web_search"},
+    )
+    assert strip_listed_anthropic_server_tools(request) is request
 
 
 def test_web_server_tool_detected_when_tool_choice_forces_it():
@@ -753,23 +782,48 @@ async def test_drain_response_body_capped_stops_after_first_chunk_when_oversized
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("provider_id", _OPENAI_CHAT_PROVIDER_IDS)
-async def test_service_rejects_listed_server_tools_on_openai_chat(
+@pytest.mark.parametrize("web_tools_enabled", [False, True])
+async def test_service_strips_listed_server_tools_on_openai_chat(
     provider_id: str,
+    web_tools_enabled: bool,
 ) -> None:
-    settings = Settings()
+    """Claude Code lists web_search; OpenAI-chat (e.g. NIM) should strip, not 400."""
+    settings = Settings.model_validate({"ENABLE_WEB_SERVER_TOOLS": web_tools_enabled})
+
+    async def fake_stream(request, *_a, **_k):
+        names = [tool.name for tool in (request.tools or [])]
+        assert "web_search" not in names
+        assert "Bash" in names
+        yield 'event: message_start\ndata: {"type":"message_start"}\n\n'
+        yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+    mock_provider = MagicMock()
+    mock_provider.stream_response = fake_stream
     service = MessagesHandler(
         settings,
-        provider_getter=lambda _: MagicMock(),
+        provider_getter=lambda _: mock_provider,
         model_router=FixedProviderModelRouter(settings, provider_id),
     )
     request = MessagesRequest(
         model="m",
         max_tokens=20,
         messages=[Message(role="user", content="q")],
-        tools=[Tool(name="web_search", type="web_search_20250305")],
+        tools=[
+            Tool(name="web_search", type="web_search_20250305"),
+            Tool(
+                name="Bash",
+                type="custom",
+                description="Run a shell command",
+                input_schema={"type": "object", "properties": {}},
+            ),
+        ],
     )
-    with pytest.raises(InvalidRequestError, match="OpenAI Chat upstreams"):
-        await service.create(request)
+    await service.create(request)
+    mock_provider.preflight_stream.assert_called()
+    preflight_request = mock_provider.preflight_stream.call_args.args[0]
+    preflight_names = [tool.name for tool in (preflight_request.tools or [])]
+    assert "web_search" not in preflight_names
+    assert "Bash" in preflight_names
 
 
 @pytest.mark.asyncio
