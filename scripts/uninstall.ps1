@@ -23,7 +23,7 @@ function Show-Usage {
 Usage: uninstall.ps1 [options]
 
 Removes the Free Claude Code uv tool and deletes ~/.fcc/.
-Does not remove uv, Claude Code, Codex, or the uv-managed Python runtime.
+Does not remove uv, Claude Code, or the uv-managed Python runtime.
 
 Options:
   -DryRun                Print commands without running them.
@@ -172,4 +172,4 @@ Purge-FccHome
 
 Write-Host ""
 Write-Host "Free Claude Code has been removed."
-Write-Host "uv, Claude Code, Codex, and the uv-managed Python runtime were left installed."
+Write-Host "uv, Claude Code, and the uv-managed Python runtime were left installed."

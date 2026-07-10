@@ -12,7 +12,7 @@ show_usage() {
 Usage: uninstall.sh [options]
 
 Removes the Free Claude Code uv tool and deletes ~/.fcc/.
-Does not remove uv, Claude Code, Codex, or the uv-managed Python runtime.
+Does not remove uv, Claude Code, or the uv-managed Python runtime.
 
 Options:
   --dry-run                Print commands without running them.
@@ -189,4 +189,4 @@ step "Purging FCC config and data from ~/.fcc"
 purge_fcc_home
 
 printf '\nFree Claude Code has been removed.\n'
-printf 'uv, Claude Code, Codex, and the uv-managed Python runtime were left installed.\n'
+printf 'uv, Claude Code, and the uv-managed Python runtime were left installed.\n'
